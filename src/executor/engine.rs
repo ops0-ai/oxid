@@ -1688,7 +1688,7 @@ fn populate_nested_object(
 ///   ["set", ["object", {"attr1": "string", "attr2": "number"}]]
 ///   ["object", {"attr1": "string"}]
 ///   ["map", "string"]
-fn coerce_value_to_cty_type(
+pub fn coerce_value_to_cty_type(
     value: serde_json::Value,
     cty_type: &serde_json::Value,
 ) -> serde_json::Value {
@@ -1697,50 +1697,125 @@ fn coerce_value_to_cty_type(
     }
 
     match cty_type {
+        // Collection types: ["list", elem], ["set", elem], ["map", elem], ["object", attrs]
         serde_json::Value::Array(arr) if arr.len() == 2 => {
             let type_name = arr[0].as_str().unwrap_or("");
             let elem_type = &arr[1];
             match type_name {
-                "list" | "set" => {
-                    match &value {
-                        // Single object → populate and wrap in array
-                        serde_json::Value::Object(_) => {
-                            let populated = populate_object_from_cty(value, elem_type);
-                            serde_json::Value::Array(vec![populated])
-                        }
-                        // Already an array → populate each element
-                        serde_json::Value::Array(items) => {
-                            let populated: Vec<serde_json::Value> = items
-                                .iter()
-                                .map(|item| populate_object_from_cty(item.clone(), elem_type))
-                                .collect();
-                            serde_json::Value::Array(populated)
-                        }
-                        _ => value,
+                "list" | "set" => match value {
+                    // Single object → coerce and wrap in array
+                    serde_json::Value::Object(_) => {
+                        let coerced = coerce_value_to_cty_type(value, elem_type);
+                        serde_json::Value::Array(vec![coerced])
+                    }
+                    // Already an array → coerce each element recursively
+                    serde_json::Value::Array(items) => {
+                        let coerced: Vec<serde_json::Value> = items
+                            .into_iter()
+                            .map(|item| coerce_value_to_cty_type(item, elem_type))
+                            .collect();
+                        serde_json::Value::Array(coerced)
+                    }
+                    _ => coerce_value_to_cty_type(value, elem_type),
+                },
+                "map" => {
+                    if let serde_json::Value::Object(map) = value {
+                        let coerced: serde_json::Map<String, serde_json::Value> = map
+                            .into_iter()
+                            .map(|(k, v)| (k, coerce_value_to_cty_type(v, elem_type)))
+                            .collect();
+                        serde_json::Value::Object(coerced)
+                    } else {
+                        value
                     }
                 }
-                "object" => populate_object_from_cty(value, elem_type),
+                "object" => {
+                    // elem_type is the attribute map: {"attr1": "string", ...}
+                    if let Some(attr_map) = elem_type.as_object() {
+                        if let serde_json::Value::Object(mut obj) = value {
+                            for (attr_name, attr_type) in attr_map {
+                                if let Some(existing) = obj.remove(attr_name) {
+                                    obj.insert(
+                                        attr_name.clone(),
+                                        coerce_value_to_cty_type(existing, attr_type),
+                                    );
+                                } else {
+                                    obj.insert(attr_name.clone(), serde_json::Value::Null);
+                                }
+                            }
+                            serde_json::Value::Object(obj)
+                        } else {
+                            value
+                        }
+                    } else {
+                        value
+                    }
+                }
                 _ => value,
             }
         }
+        // Scalar types: "string", "number", "bool"
+        serde_json::Value::String(expected) => match expected.as_str() {
+            "string" => match &value {
+                serde_json::Value::Number(n) => serde_json::Value::String(n.to_string()),
+                serde_json::Value::Bool(b) => serde_json::Value::String(b.to_string()),
+                _ => value,
+            },
+            "number" => match &value {
+                serde_json::Value::String(s) => {
+                    if let Ok(n) = s.parse::<i64>() {
+                        serde_json::Value::Number(n.into())
+                    } else if let Ok(n) = s.parse::<f64>() {
+                        serde_json::Number::from_f64(n)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(value)
+                    } else {
+                        value
+                    }
+                }
+                serde_json::Value::Bool(b) => {
+                    serde_json::Value::Number(if *b { 1 } else { 0 }.into())
+                }
+                _ => value,
+            },
+            "bool" => match &value {
+                serde_json::Value::String(s) => match s.as_str() {
+                    "true" | "1" => serde_json::Value::Bool(true),
+                    "false" | "0" => serde_json::Value::Bool(false),
+                    _ => value,
+                },
+                serde_json::Value::Number(n) => {
+                    serde_json::Value::Bool(n.as_f64().is_some_and(|v| v != 0.0))
+                }
+                _ => value,
+            },
+            _ => value, // Unknown scalar type (e.g., "dynamic")
+        },
         _ => value,
     }
 }
 
-/// Populate a JSON object with all attributes from a cty object type definition.
+/// Populate a JSON object with all attributes from a cty object type definition,
+/// coercing existing attribute values to match their declared types.
 /// cty object type is ["object", {"attr1": "string", "attr2": "number", ...}]
 /// The second element is a map of attribute names to their types.
-fn populate_object_from_cty(
+pub fn populate_object_from_cty(
     value: serde_json::Value,
     cty_elem_type: &serde_json::Value,
 ) -> serde_json::Value {
     // If the element type is ["object", {attr_map}], populate missing attrs as null
+    // and coerce existing attribute values to their declared types
     if let serde_json::Value::Array(arr) = cty_elem_type {
         if arr.len() == 2 && arr[0].as_str() == Some("object") {
             if let Some(attr_map) = arr[1].as_object() {
                 if let serde_json::Value::Object(mut obj) = value {
-                    for (attr_name, _attr_type) in attr_map {
-                        if !obj.contains_key(attr_name) {
+                    for (attr_name, attr_type) in attr_map {
+                        if let Some(existing) = obj.remove(attr_name) {
+                            obj.insert(
+                                attr_name.clone(),
+                                coerce_value_to_cty_type(existing, attr_type),
+                            );
+                        } else {
                             obj.insert(attr_name.clone(), serde_json::Value::Null);
                         }
                     }

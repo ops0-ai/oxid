@@ -33,6 +33,26 @@ fn oxid_cmd(subcommand: &str, fixture: &Path, work_dir: &Path) -> Command {
     cmd
 }
 
+/// Builds an `oxid` Command with extra args (e.g., `--auto-approve`).
+fn oxid_cmd_with_args(
+    subcommand: &str,
+    fixture: &Path,
+    work_dir: &Path,
+    extra_args: &[&str],
+) -> Command {
+    let mut cmd = assert_cmd::cargo_bin_cmd!("oxid");
+    cmd.arg("-c")
+        .arg(fixture)
+        .arg("-w")
+        .arg(work_dir)
+        .arg(subcommand)
+        .env("NO_COLOR", "1");
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd
+}
+
 /// Returns true if `OXID_E2E_AWS` is set (any non-empty value).
 fn aws_enabled() -> bool {
     std::env::var("OXID_E2E_AWS")
@@ -173,6 +193,77 @@ fn e2e_03_mixed_plan() {
                 .and(predicate::str::contains("will be created"))
                 .and(predicate::str::contains("4 to add")),
         );
+}
+
+// ── 07-apply-destroy ────────────────────────────────────────────────────────
+// Regression test for issue #2: map(string) coercion of integer values.
+// Exercises full apply + destroy cycle with no cloud credentials.
+
+#[test]
+#[ignore]
+fn e2e_07_apply_destroy_plan() {
+    let fixture = fixture_dir("07-apply-destroy");
+    let work = TempDir::new().unwrap();
+    oxid_cmd("init", &fixture, work.path()).assert().success();
+    oxid_cmd("plan", &fixture, work.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("random_pet.name")
+                .and(predicate::str::contains("random_integer.port"))
+                .and(predicate::str::contains("null_resource.coerce_test"))
+                .and(predicate::str::contains("will be created"))
+                .and(predicate::str::contains("3 to add")),
+        );
+}
+
+#[test]
+#[ignore]
+fn e2e_07_apply_destroy_apply() {
+    let fixture = fixture_dir("07-apply-destroy");
+    let work = TempDir::new().unwrap();
+    oxid_cmd("init", &fixture, work.path()).assert().success();
+    oxid_cmd_with_args("apply", &fixture, work.path(), &["--auto-approve"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("null_resource.coerce_test: Creation complete")
+                .and(predicate::str::contains(
+                    "random_integer.port: Creation complete",
+                ))
+                .and(predicate::str::contains(
+                    "random_pet.name: Creation complete",
+                ))
+                .and(predicate::str::contains("3 added")),
+        );
+}
+
+#[test]
+#[ignore]
+fn e2e_07_apply_destroy_full_cycle() {
+    let fixture = fixture_dir("07-apply-destroy");
+    let work = TempDir::new().unwrap();
+
+    // init
+    oxid_cmd("init", &fixture, work.path()).assert().success();
+
+    // apply
+    oxid_cmd_with_args("apply", &fixture, work.path(), &["--auto-approve"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("3 added"));
+
+    // plan after apply should show no changes
+    oxid_cmd("plan", &fixture, work.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No changes"));
+
+    // destroy
+    oxid_cmd_with_args("destroy", &fixture, work.path(), &["--auto-approve"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Destroy complete"));
 }
 
 // ─── Tier 2: AWS fixtures (require OXID_E2E_AWS=1) ──────────────────────────
