@@ -13,7 +13,7 @@ Oxid parses `.tf` (HCL) and `.tf.json` files natively and communicates directly 
 | **Execution** | Wave-based (batch) | Event-driven per-resource |
 | **Parallelism** | Resources in same wave wait for slowest | Dependents start the instant their deps complete |
 | **State** | JSON file or remote backend | SQLite (local) / PostgreSQL (teams) |
-| **Config** | HCL only | HCL + JSON + YAML |
+| **Config** | HCL + JSON | HCL + JSON + YAML |
 | **Provider protocol** | Wraps binary / shared lib | Direct gRPC (tfplugin5/6) |
 | **Queryable state** | `terraform show` | Full SQL: `oxid query "SELECT * FROM resources"` |
 | **License** | BSL / MPL | Apache-2.0 |
