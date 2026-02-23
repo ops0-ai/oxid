@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rusqlite::{params, Connection};
+use serde::Deserialize;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -645,18 +646,18 @@ impl StateBackend for SqliteBackend {
 
         for tf_resource in &state.resources {
             for (idx, instance) in tf_resource.instances.iter().enumerate() {
-                let address = if tf_resource.instances.len() > 1 {
-                    if let Some(ref key) = instance.index_key {
-                        format!(
-                            "{}.{}[{}]",
-                            tf_resource.resource_type, tf_resource.name, key
-                        )
-                    } else {
-                        format!(
-                            "{}.{}[{}]",
-                            tf_resource.resource_type, tf_resource.name, idx
-                        )
-                    }
+                let address = if let Some(ref key) = instance.index_key {
+                    // count or for_each resource — always include index
+                    format!(
+                        "{}.{}[{}]",
+                        tf_resource.resource_type, tf_resource.name, key
+                    )
+                } else if tf_resource.instances.len() > 1 {
+                    // Multiple instances without explicit index_key — use positional index
+                    format!(
+                        "{}.{}[{}]",
+                        tf_resource.resource_type, tf_resource.name, idx
+                    )
                 } else {
                     format!("{}.{}", tf_resource.resource_type, tf_resource.name)
                 };
@@ -786,6 +787,18 @@ fn resource_from_row(row: &rusqlite::Row<'_>) -> ResourceState {
 
 // ─── Terraform state file types for import ──────────────────────────────────
 
+fn deserialize_index_key<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(v.map(|val| match val {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct TfState {
     #[serde(default)]
@@ -813,7 +826,7 @@ fn default_mode() -> String {
 
 #[derive(Debug, serde::Deserialize)]
 struct TfInstance {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_index_key")]
     index_key: Option<String>,
     #[serde(default)]
     schema_version: Option<i32>,

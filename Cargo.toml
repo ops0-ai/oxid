@@ -1,6 +1,6 @@
 [package]
 name = "oxid"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Standalone infrastructure-as-code engine — OSS alternative to Terraform/OpenTofu"
 license = "Apache-2.0"
@@ -73,10 +73,15 @@ flate2 = "1"
 tar = "0.4"
 zip = "2"
 
+# AWS SDK for S3 backend state import (optional)
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+
 [features]
-default = ["sqlite"]
+default = ["sqlite", "s3-backend"]
 sqlite = []
 postgres = ["sqlx"]
+s3-backend = ["aws-sdk-s3", "aws-config"]
 
 [build-dependencies]
 tonic-build = "0.12"

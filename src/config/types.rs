@@ -75,6 +75,24 @@ pub struct WorkspaceConfig {
 pub struct TerraformSettings {
     pub required_providers: HashMap<String, RequiredProvider>,
     pub required_version: Option<String>,
+    pub backend: Option<BackendConfig>,
+}
+
+/// Terraform backend configuration parsed from `terraform { backend "..." { ... } }`.
+#[derive(Debug, Clone)]
+pub enum BackendConfig {
+    S3 {
+        bucket: String,
+        key: String,
+        region: Option<String>,
+        dynamodb_table: Option<String>,
+        role_arn: Option<String>,
+        endpoint: Option<String>,
+        profile: Option<String>,
+    },
+    Unsupported {
+        backend_type: String,
+    },
 }
 
 #[derive(Debug, Clone)]

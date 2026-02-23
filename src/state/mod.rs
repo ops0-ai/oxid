@@ -3,6 +3,7 @@ pub mod lock;
 pub mod migration;
 pub mod models;
 pub mod query;
+pub mod remote;
 pub mod schema;
 pub mod sqlite;
 pub mod store;

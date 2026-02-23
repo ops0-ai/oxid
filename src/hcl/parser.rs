@@ -84,14 +84,21 @@ fn parse_terraform_block(block: &hcl::Block) -> Result<TerraformSettings> {
     for structure in block.body().iter() {
         match structure {
             hcl::Structure::Block(inner_block) => {
-                if inner_block.identifier() == "required_providers" {
-                    for attr_structure in inner_block.body().iter() {
-                        if let hcl::Structure::Attribute(attr) = attr_structure {
-                            let name = attr.key.to_string();
-                            let req = parse_required_provider(&attr.expr)?;
-                            settings.required_providers.insert(name, req);
+                let ident = inner_block.identifier().to_string();
+                match ident.as_str() {
+                    "required_providers" => {
+                        for attr_structure in inner_block.body().iter() {
+                            if let hcl::Structure::Attribute(attr) = attr_structure {
+                                let name = attr.key.to_string();
+                                let req = parse_required_provider(&attr.expr)?;
+                                settings.required_providers.insert(name, req);
+                            }
                         }
                     }
+                    "backend" => {
+                        settings.backend = Some(parse_backend_block(inner_block));
+                    }
+                    _ => {}
                 }
             }
             hcl::Structure::Attribute(attr) => {
@@ -104,6 +111,34 @@ fn parse_terraform_block(block: &hcl::Block) -> Result<TerraformSettings> {
     }
 
     Ok(settings)
+}
+
+fn parse_backend_block(block: &hcl::Block) -> BackendConfig {
+    let backend_type = block
+        .labels()
+        .first()
+        .map(|l| l.as_str().to_string())
+        .unwrap_or_default();
+
+    let mut attrs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for structure in block.body().iter() {
+        if let hcl::Structure::Attribute(attr) = structure {
+            attrs.insert(attr.key.to_string(), expr_to_string(&attr.expr));
+        }
+    }
+
+    match backend_type.as_str() {
+        "s3" => BackendConfig::S3 {
+            bucket: attrs.remove("bucket").unwrap_or_default(),
+            key: attrs.remove("key").unwrap_or_default(),
+            region: attrs.remove("region"),
+            dynamodb_table: attrs.remove("dynamodb_table"),
+            role_arn: attrs.remove("role_arn"),
+            endpoint: attrs.remove("endpoint"),
+            profile: attrs.remove("profile"),
+        },
+        _ => BackendConfig::Unsupported { backend_type },
+    }
 }
 
 fn parse_required_provider(expr: &hcl::Expression) -> Result<RequiredProvider> {

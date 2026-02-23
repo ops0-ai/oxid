@@ -177,10 +177,10 @@ enum StateCommands {
 
 #[derive(Subcommand)]
 enum ImportCommands {
-    /// Import from a .tfstate file
+    /// Import from a .tfstate file (local path or auto-detect remote backend)
     Tfstate {
-        /// Path to .tfstate file
-        path: String,
+        /// Path to .tfstate file (omit to auto-detect backend from .tf files)
+        path: Option<String>,
     },
 
     /// Import a single resource by provider ID
@@ -676,8 +676,53 @@ async fn cmd_import(cli: &Cli, command: &ImportCommands) -> Result<()> {
 
     match command {
         ImportCommands::Tfstate { path } => {
-            let state_json = std::fs::read_to_string(path)
-                .context(format!("Failed to read tfstate file: {}", path))?;
+            let state_json = match path {
+                Some(file_path) => std::fs::read_to_string(file_path)
+                    .context(format!("Failed to read tfstate file: {}", file_path))?,
+                None => {
+                    println!(
+                        "{}",
+                        "Auto-detecting Terraform backend from .tf files...".dimmed()
+                    );
+
+                    let config_path = std::path::Path::new(&cli.config);
+                    let workspace_config = crate::hcl::parse_directory(config_path)
+                        .context("Failed to load .tf configuration for backend detection")?;
+
+                    let remote_backend = workspace_config
+                        .terraform_settings
+                        .as_ref()
+                        .and_then(|ts| ts.backend.as_ref())
+                        .context(
+                            "No backend configuration found in .tf files.\n\
+                             Expected: terraform { backend \"s3\" { ... } }\n\
+                             Alternatively, specify a local file: oxid import tfstate <path>",
+                        )?;
+
+                    match remote_backend {
+                        crate::config::types::BackendConfig::S3 {
+                            bucket,
+                            key,
+                            region,
+                            ..
+                        } => {
+                            println!(
+                                "  {} Detected S3 backend: s3://{}/{}  (region: {})",
+                                "->".blue(),
+                                bucket,
+                                key,
+                                region.as_deref().unwrap_or("default")
+                            );
+                        }
+                        crate::config::types::BackendConfig::Unsupported { backend_type } => {
+                            println!("  {} Detected backend: {}", "->".blue(), backend_type);
+                        }
+                    }
+
+                    println!("{}", "Fetching remote state...".dimmed());
+                    crate::state::remote::fetch_remote_state(remote_backend).await?
+                }
+            };
 
             let result = backend.import_tfstate(&ws.id, &state_json).await?;
 

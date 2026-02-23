@@ -167,6 +167,9 @@ fn merge_workspace(main: &mut WorkspaceConfig, partial: WorkspaceConfig) {
             if main_tf.required_version.is_none() {
                 main_tf.required_version = partial_tf.required_version;
             }
+            if main_tf.backend.is_none() {
+                main_tf.backend = partial_tf.backend;
+            }
         }
     }
 }

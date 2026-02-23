@@ -268,11 +268,47 @@ impl ResourceEngine {
                     };
 
                     // Check if resource exists in state
-                    let prior_state = backend
+                    let prior_state_raw = backend
                         .get_resource(&ws_id, address)
                         .await?
                         .map(|r| serde_json::from_str::<serde_json::Value>(&r.attributes_json))
                         .transpose()?;
+
+                    // Pad prior_state with all schema attributes (provider requires all keys)
+                    let prior_state_padded = if let Some(ref prior) = prior_state_raw {
+                        if let Ok(Some(ref schema)) =
+                            pm.get_resource_schema(provider_source, resource_type).await
+                        {
+                            Some(build_full_resource_config(prior, schema))
+                        } else {
+                            prior_state_raw.clone()
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Refresh: call ReadResource to get actual cloud state
+                    let prior_state = if let Some(ref padded) = prior_state_padded {
+                        match pm
+                            .read_resource(provider_source, resource_type, padded)
+                            .await
+                        {
+                            Ok(Some(refreshed)) => {
+                                // Update shared resource_states for cross-refs
+                                resource_states.insert(address.clone(), refreshed.clone());
+                                Some(refreshed)
+                            }
+                            Ok(None) => {
+                                // Resource was deleted outside of oxid
+                                let _ = backend.delete_resource(&ws_id, address).await;
+                                resource_states.remove(address);
+                                None
+                            }
+                            Err(_) => prior_state_padded.clone(),
+                        }
+                    } else {
+                        None
+                    };
 
                     let plan_result = match pm
                         .plan_resource(
@@ -505,11 +541,24 @@ impl ResourceEngine {
                         };
 
                         // Get prior state from database
-                        let prior_state = backend
+                        let prior_state_raw = backend
                             .get_resource(&ws_id, address)
                             .await?
                             .map(|r| serde_json::from_str::<serde_json::Value>(&r.attributes_json))
                             .transpose()?;
+
+                        // Pad prior_state with all schema attributes (provider requires all keys)
+                        let prior_state = if let Some(ref prior) = prior_state_raw {
+                            if let Ok(Some(ref schema)) =
+                                pm.get_resource_schema(provider_source, resource_type).await
+                            {
+                                Some(build_full_resource_config(prior, schema))
+                            } else {
+                                prior_state_raw.clone()
+                            }
+                        } else {
+                            None
+                        };
 
                         // Plan
                         let plan_result = pm
@@ -779,16 +828,29 @@ impl ResourceEngine {
                             None => {}
                         }
                         // Get current state
-                        let current_state = backend
+                        let current_state_raw = backend
                             .get_resource(&ws_id, address)
                             .await?
                             .map(|r| serde_json::from_str::<serde_json::Value>(&r.attributes_json))
                             .transpose()?;
 
-                        if current_state.is_none() {
+                        if current_state_raw.is_none() {
                             debug!(address = %address, "Resource not in state, skipping destroy");
                             return Ok(None);
                         }
+
+                        // Pad current_state with all schema attributes (provider requires all keys)
+                        let current_state = if let Some(ref raw) = current_state_raw {
+                            if let Ok(Some(ref schema)) =
+                                pm.get_resource_schema(provider_source, resource_type).await
+                            {
+                                Some(build_full_resource_config(raw, schema))
+                            } else {
+                                current_state_raw.clone()
+                            }
+                        } else {
+                            None
+                        };
 
                         let user_config = attributes_to_json(&config.attributes, &eval_ctx);
 
