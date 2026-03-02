@@ -940,7 +940,7 @@ impl ResourceEngine {
     }
 
     /// Initialize all providers referenced in the workspace.
-    async fn initialize_providers(&self, workspace: &WorkspaceConfig) -> Result<()> {
+    pub async fn initialize_providers(&self, workspace: &WorkspaceConfig) -> Result<()> {
         // Build variable defaults map for resolving var.xxx references
         let var_defaults = build_variable_defaults(workspace);
 
@@ -1461,6 +1461,27 @@ fn resolve_reference(parts: &[String], ctx: &EvalContext) -> serde_json::Value {
             return serde_json::Value::Array(values.into_iter().map(|(_, v)| v).collect());
         }
 
+        // Indexed reference: aws_instance.web[count.index].id or aws_instance.web[0].id
+        if parts.len() >= 4 && parts[2].starts_with('[') && parts[2].ends_with(']') {
+            let index_expr = &parts[2][1..parts[2].len() - 1];
+            let index_val = if index_expr == "count.index" {
+                ctx.count_index
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| index_expr.to_string())
+            } else if index_expr == "each.key" {
+                ctx.each_key
+                    .clone()
+                    .unwrap_or_else(|| index_expr.to_string())
+            } else {
+                // Literal index (e.g. [0], [1], ["key"])
+                index_expr.to_string()
+            };
+            let indexed_address = format!("{}[{}]", address, index_val);
+            if let Some(state) = ctx.resource_states.get(&indexed_address) {
+                return traverse_json_value(state.value(), &parts[3..]);
+            }
+        }
+
         if let Some(state) = ctx.resource_states.get(&address) {
             return traverse_json_value(state.value(), &parts[2..]);
         }
@@ -1633,7 +1654,7 @@ fn build_full_provider_config(
 /// Build a full resource config with all schema attributes.
 /// Similar to `build_full_provider_config`, but for resource types.
 /// cty msgpack requires ALL attributes to be present (null for unset/computed).
-fn build_full_resource_config(
+pub fn build_full_resource_config(
     user_config: &serde_json::Value,
     schema: &serde_json::Value,
 ) -> serde_json::Value {

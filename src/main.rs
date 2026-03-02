@@ -136,9 +136,9 @@ enum Commands {
 
     /// Detect drift between state and real infrastructure
     Drift {
-        /// Refresh state from providers before comparing
+        /// Skip provider refresh (only compare config vs state addresses)
         #[arg(long)]
-        refresh: bool,
+        no_refresh: bool,
     },
 
     /// Validate configuration without running anything
@@ -252,7 +252,7 @@ async fn main() -> Result<()> {
         Commands::Workspace { ref command } => cmd_workspace(&cli, command).await,
         Commands::Graph { ref graph_type } => cmd_graph(&cli, graph_type).await,
         Commands::Providers => cmd_providers(&cli).await,
-        Commands::Drift { refresh } => cmd_drift(&cli, refresh).await,
+        Commands::Drift { no_refresh } => cmd_drift(&cli, !no_refresh).await,
         Commands::Validate => cmd_validate(&cli).await,
     }
 }
@@ -955,21 +955,20 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
         .await?
         .context("No default workspace. Run 'oxid init' first.")?;
 
+    // Collect attribute-level drift: (address, vec of (attr_name, stored_val, cloud_val))
+    let mut attribute_drifts: Vec<(String, Vec<(String, String, String)>)> = Vec::new();
+    let mut deleted_resources: Vec<String> = Vec::new();
+
+    // Refresh from cloud to detect attribute-level drift
     if refresh {
         println!("{}", "Refreshing state from providers...".dimmed());
         let pm = Arc::new(provider_manager(&cli.working_dir));
         let engine = ResourceEngine::new(pm, cli.parallelism);
 
-        // Initialize providers
-        for provider in &workspace.providers {
-            let version = provider.version_constraint.as_deref().unwrap_or(">= 0.0.0");
-            let _ = engine
-                .provider_manager()
-                .get_connection(&provider.source, version)
-                .await;
-        }
+        // Initialize and configure providers (connect, get schema, configure with region/creds)
+        engine.initialize_providers(&workspace).await?;
 
-        // Read each resource from the provider and update state
+        // Read each resource from the provider, compare, and update state
         let resources = backend
             .list_resources(&ws.id, &ResourceFilter::default())
             .await?;
@@ -978,28 +977,36 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
             if resource.provider_source.is_empty() {
                 continue;
             }
-            let current: serde_json::Value =
+            let stored_state: serde_json::Value =
                 serde_json::from_str(&resource.attributes_json).unwrap_or_default();
-            match engine
+
+            // Pad with schema so ReadResource gets all required attributes
+            let padded_state = if let Ok(Some(ref schema)) = engine
                 .provider_manager()
-                .read_resource(&resource.provider_source, &resource.resource_type, &current)
+                .get_resource_schema(&resource.provider_source, &resource.resource_type)
                 .await
             {
-                Ok(Some(refreshed_state)) => {
-                    let mut updated = resource.clone();
-                    updated.attributes_json = serde_json::to_string(&refreshed_state)?;
-                    updated.updated_at = chrono::Utc::now().to_rfc3339();
-                    backend.upsert_resource(&updated).await?;
+                executor::engine::build_full_resource_config(&stored_state, schema)
+            } else {
+                stored_state.clone()
+            };
+
+            match engine
+                .provider_manager()
+                .read_resource(&resource.provider_source, &resource.resource_type, &padded_state)
+                .await
+            {
+                Ok(Some(cloud_state)) => {
+                    // Compare stored state vs cloud state — read-only, don't update DB
+                    let changed_attrs = diff_attributes(&stored_state, &cloud_state);
+                    if !changed_attrs.is_empty() {
+                        attribute_drifts.push((resource.address.clone(), changed_attrs));
+                    }
                     refreshed += 1;
                 }
                 Ok(None) => {
-                    // Resource no longer exists
-                    println!(
-                        "  {} {} — {}",
-                        "-".red(),
-                        resource.address.bold(),
-                        "resource no longer exists".red()
-                    );
+                    // Resource deleted outside of oxid
+                    deleted_resources.push(resource.address.clone());
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1017,59 +1024,290 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
         }
     }
 
-    // Compare config vs state for drift
+    // Compare config vs state for address-level drift
     let resources = backend
         .list_resources(&ws.id, &ResourceFilter::default())
         .await?;
 
-    // Resources in config
-    let config_addresses: std::collections::HashSet<String> = workspace
-        .resources
-        .iter()
-        .map(|r| format!("{}.{}", r.resource_type, r.name))
-        .collect();
+    // Resources in config (expanded for count/for_each)
+    let var_defaults = executor::engine::build_variable_defaults(&workspace);
+    let mut config_addresses: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for r in &workspace.resources {
+        let base = format!("{}.{}", r.resource_type, r.name);
+        if let Some(ref count_expr) = r.count {
+            let ctx = executor::engine::EvalContext::plan_only(var_defaults.clone());
+            let val = executor::engine::eval_expression(count_expr, &ctx);
+            if let Some(n) = val.as_u64() {
+                for i in 0..n as usize {
+                    config_addresses.insert(format!("{}[{}]", base, i));
+                }
+            } else {
+                config_addresses.insert(base);
+            }
+        } else if let Some(ref for_each_expr) = r.for_each {
+            let ctx = executor::engine::EvalContext::plan_only(var_defaults.clone());
+            let val = executor::engine::eval_expression(for_each_expr, &ctx);
+            match val {
+                serde_json::Value::Object(map) => {
+                    for key in map.keys() {
+                        config_addresses.insert(format!("{}[\"{}\"]", base, key));
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for v in &arr {
+                        let key = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+                        config_addresses.insert(format!("{}[\"{}\"]", base, key));
+                    }
+                }
+                _ => {
+                    config_addresses.insert(base);
+                }
+            }
+        } else {
+            config_addresses.insert(base);
+        }
+    }
 
     // Resources in state
     let state_addresses: std::collections::HashSet<String> =
         resources.iter().map(|r| r.address.clone()).collect();
 
-    let mut drifts = Vec::new();
+    let mut drifts: Vec<(String, String, String)> = Vec::new();
 
     // New in config, not in state
     for addr in config_addresses.difference(&state_addresses) {
-        drifts.push(("+", addr.clone(), "new resource in config"));
+        drifts.push(("+".to_string(), addr.clone(), "new resource in config".to_string()));
     }
 
-    // In state, not in config
+    // In state, not in config (or deleted from cloud)
     for addr in state_addresses.difference(&config_addresses) {
-        drifts.push(("-", addr.clone(), "in state but not in config"));
+        drifts.push(("-".to_string(), addr.clone(), "in state but not in config".to_string()));
     }
 
-    if drifts.is_empty() {
+    // Resources deleted from cloud
+    for addr in &deleted_resources {
+        drifts.push(("-".to_string(), addr.clone(), "deleted outside of oxid".to_string()));
+    }
+
+    let has_drift = !drifts.is_empty() || !attribute_drifts.is_empty() || !deleted_resources.is_empty();
+
+    if !has_drift {
         output::formatter::print_success("No drift detected. Infrastructure is in sync.");
     } else {
+        let total = drifts.len() + attribute_drifts.len() + deleted_resources.len();
         println!();
         println!(
             "{}",
-            format!("Drift Detected ({} issues)", drifts.len())
+            format!("Drift Detected ({} issue{})", total, if total == 1 { "" } else { "s" })
                 .bold()
                 .yellow()
         );
-        println!("{}", "─".repeat(60));
+        println!("{}", "─".repeat(70));
+
+        // Address-level drift (new in config / missing from config)
         for (icon, addr, detail) in &drifts {
-            let colored_icon = match *icon {
+            let colored_icon = match icon.as_str() {
                 "+" => "+".green().to_string(),
                 "-" => "-".red().to_string(),
-                "~" => "~".yellow().to_string(),
                 _ => icon.to_string(),
             };
             println!("  {} {} {}", colored_icon, addr.bold(), detail.dimmed());
         }
-        println!("{}", "─".repeat(60));
+
+        // Resources deleted from cloud
+        for addr in &deleted_resources {
+            println!("  {} {} {}", "-".red(), addr.bold(), "deleted outside of oxid".red());
+        }
+
+        // Attribute-level drift with values
+        for (addr, changes) in &attribute_drifts {
+            println!("  {} {}", "~".yellow(), addr.bold());
+            for (attr, stored_val, cloud_val) in changes {
+                println!(
+                    "      {} {}: {} {} {}",
+                    "~".yellow(),
+                    attr.cyan(),
+                    stored_val.red(),
+                    "→".dimmed(),
+                    cloud_val.green(),
+                );
+            }
+        }
+
+        println!("{}", "─".repeat(70));
         println!();
     }
 
     Ok(())
+}
+
+/// Compare two JSON objects and return a list of (attr_name, stored_display, cloud_display) for diffs.
+/// Ignores computed/read-only attributes and treats null/[]/{}/"" as equivalent empty values.
+fn diff_attributes(
+    stored: &serde_json::Value,
+    cloud: &serde_json::Value,
+) -> Vec<(String, String, String)> {
+    let mut changed = Vec::new();
+
+    let stored_obj = match stored.as_object() {
+        Some(o) => o,
+        None => return changed,
+    };
+    let cloud_obj = match cloud.as_object() {
+        Some(o) => o,
+        None => return changed,
+    };
+
+    // Check attributes that exist in stored state
+    for (key, stored_val) in stored_obj {
+        // Skip computed/read-only metadata fields that providers populate
+        if key == "id" || key == "arn" || key.ends_with("_at")
+            || key.ends_with("_id") || key.ends_with("_arn") || key.ends_with("_arns")
+            || key == "owner_id" || key == "arn_suffix"
+            || key == "dns_name" || key == "zone_id"
+            || key.starts_with("private_") || key.starts_with("public_")
+            || key == "association_id" || key == "network_interface"
+            || key == "hosted_zone_id" || key == "domain_name"
+            || key == "main_route_table_id" || key == "default_route_table_id"
+            || key == "default_network_acl_id" || key == "default_security_group_id"
+            || key == "ipv6_association_id" || key == "ipv6_cidr_block_network_border_group"
+            || key == "instance_state" || key == "primary_network_interface_id"
+            || key.ends_with("_status") || key.ends_with("_state")
+        {
+            continue;
+        }
+        if let Some(cloud_val) = cloud_obj.get(key) {
+            if !json_values_equal(stored_val, cloud_val) {
+                // For nested objects (like tags), drill in and show only changed sub-keys
+                if let (Some(stored_map), Some(cloud_map)) =
+                    (stored_val.as_object(), cloud_val.as_object())
+                {
+                    for (sub_key, sub_stored) in stored_map {
+                        let sub_cloud = cloud_map
+                            .get(sub_key)
+                            .unwrap_or(&serde_json::Value::Null);
+                        if !json_values_equal(sub_stored, sub_cloud) {
+                            changed.push((
+                                format!("{}.{}", key, sub_key),
+                                format_drift_value(sub_stored),
+                                format_drift_value(sub_cloud),
+                            ));
+                        }
+                    }
+                    // Keys added in cloud but not in stored
+                    for (sub_key, sub_cloud) in cloud_map {
+                        if !stored_map.contains_key(sub_key) {
+                            changed.push((
+                                format!("{}.{}", key, sub_key),
+                                "(absent)".to_string(),
+                                format_drift_value(sub_cloud),
+                            ));
+                        }
+                    }
+                } else {
+                    changed.push((
+                        key.clone(),
+                        format_drift_value(stored_val),
+                        format_drift_value(cloud_val),
+                    ));
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Format a JSON value for compact drift display.
+fn format_drift_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "(null)".to_string(),
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                "(empty)".to_string()
+            } else if s.len() > 80 {
+                format!("\"{}...\"", &s[..77])
+            } else {
+                format!("\"{}\"", s)
+            }
+        }
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(a) => {
+            if a.is_empty() {
+                "[]".to_string()
+            } else {
+                let compact = serde_json::to_string(v).unwrap_or_default();
+                if compact.len() > 80 {
+                    format!("[{} items]", a.len())
+                } else {
+                    compact
+                }
+            }
+        }
+        serde_json::Value::Object(o) => {
+            if o.is_empty() {
+                "{}".to_string()
+            } else {
+                let compact = serde_json::to_string(v).unwrap_or_default();
+                if compact.len() > 120 {
+                    format!("{{{} keys}}", o.len())
+                } else {
+                    compact
+                }
+            }
+        }
+    }
+}
+
+/// Check if a JSON value is "empty" (null, empty string, empty array, empty object).
+fn is_empty_value(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        _ => false,
+    }
+}
+
+/// Compare two JSON values for drift.
+/// Treats null, "", [], {} as equivalent empty values (AWS provider inconsistency).
+fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+
+    // Both empty → equal (handles null vs [] vs {} vs "")
+    if is_empty_value(a) && is_empty_value(b) {
+        return true;
+    }
+
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                return false;
+            }
+            a.iter().zip(b.iter()).all(|(x, y)| json_values_equal(x, y))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            // Compare all keys from both sides
+            let all_keys: std::collections::HashSet<&String> =
+                a.keys().chain(b.keys()).collect();
+            for key in all_keys {
+                let val_a = a.get(key).unwrap_or(&Value::Null);
+                let val_b = b.get(key).unwrap_or(&Value::Null);
+                if !json_values_equal(val_a, val_b) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 async fn cmd_validate(cli: &Cli) -> Result<()> {
