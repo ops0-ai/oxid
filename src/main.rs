@@ -302,7 +302,10 @@ async fn open_backend(working_dir: &str) -> Result<Box<dyn StateBackend>> {
             connection_string,
             schema,
         } => {
-            let display_host = connection_string.split('@').next_back().unwrap_or("(hidden)");
+            let display_host = connection_string
+                .split('@')
+                .next_back()
+                .unwrap_or("(hidden)");
             eprintln!(
                 "  {} Using {} backend ({}, schema: {})",
                 "→".blue(),
