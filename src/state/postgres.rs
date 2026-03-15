@@ -41,7 +41,10 @@ impl PostgresBackend {
             .with_context(|| {
                 format!(
                     "Failed to connect to PostgreSQL at {}",
-                    connection_string.split('@').last().unwrap_or("(unknown)")
+                    connection_string
+                        .split('@')
+                        .next_back()
+                        .unwrap_or("(unknown)")
                 )
             })?;
 
@@ -97,11 +100,7 @@ fn parse_json(s: &str) -> serde_json::Value {
 }
 
 /// Read a JSONB column as a String (for model compatibility).
-fn read_jsonb_as_string(
-    row: &sqlx::postgres::PgRow,
-    col: &str,
-    default: &str,
-) -> String {
+fn read_jsonb_as_string(row: &sqlx::postgres::PgRow, col: &str, default: &str) -> String {
     row.try_get::<serde_json::Value, _>(col)
         .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| default.to_string()))
         .unwrap_or_else(|_| default.to_string())
@@ -124,7 +123,9 @@ impl StateBackend for PostgresBackend {
         if let Some(r) = row {
             let dtype: String = r.get("data_type");
             if dtype == "text" {
-                tracing::warn!("Detected old TEXT-based Postgres schema. Migrating to native types...");
+                tracing::warn!(
+                    "Detected old TEXT-based Postgres schema. Migrating to native types..."
+                );
                 sqlx::query(
                     "DROP TABLE IF EXISTS run_resources, runs, resource_locks,
                      resource_outputs, resource_dependencies, resources,
@@ -185,12 +186,11 @@ impl StateBackend for PostgresBackend {
     }
 
     async fn get_workspace(&self, name: &str) -> Result<Option<Workspace>> {
-        let row = sqlx::query(
-            "SELECT id, name, created_at, updated_at FROM workspaces WHERE name = $1",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT id, name, created_at, updated_at FROM workspaces WHERE name = $1")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(row.map(|r| Workspace {
             id: r.get("id"),
@@ -201,11 +201,10 @@ impl StateBackend for PostgresBackend {
     }
 
     async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
-        let rows = sqlx::query(
-            "SELECT id, name, created_at, updated_at FROM workspaces ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT id, name, created_at, updated_at FROM workspaces ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?;
 
         Ok(rows
             .iter()
@@ -336,7 +335,7 @@ impl StateBackend for PostgresBackend {
         }
 
         let rows = query.fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(|r| resource_from_row(r)).collect())
+        Ok(rows.iter().map(resource_from_row).collect())
     }
 
     async fn count_resources(&self, workspace_id: &str) -> Result<usize> {
@@ -374,22 +373,20 @@ impl StateBackend for PostgresBackend {
     }
 
     async fn get_dependencies(&self, resource_id: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT depends_on_id FROM resource_dependencies WHERE resource_id = $1",
-        )
-        .bind(resource_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT depends_on_id FROM resource_dependencies WHERE resource_id = $1")
+                .bind(resource_id)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows.iter().map(|r| r.get("depends_on_id")).collect())
     }
 
     async fn get_dependents(&self, resource_id: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT resource_id FROM resource_dependencies WHERE depends_on_id = $1",
-        )
-        .bind(resource_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT resource_id FROM resource_dependencies WHERE depends_on_id = $1")
+                .bind(resource_id)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows.iter().map(|r| r.get("resource_id")).collect())
     }
 
@@ -410,12 +407,10 @@ impl StateBackend for PostgresBackend {
         let expires_at_str = expires_at.map(|dt| dt.to_rfc3339());
 
         // Clean up expired locks first
-        sqlx::query(
-            "DELETE FROM resource_locks WHERE expires_at IS NOT NULL AND expires_at < $1",
-        )
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM resource_locks WHERE expires_at IS NOT NULL AND expires_at < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
 
         // Try to insert the lock (will fail if already locked due to PRIMARY KEY)
         sqlx::query(
@@ -458,13 +453,11 @@ impl StateBackend for PostgresBackend {
     }
 
     async fn force_unlock(&self, address: &str, workspace_id: &str) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM resource_locks WHERE resource_address = $1 AND workspace_id = $2",
-        )
-        .bind(address)
-        .bind(workspace_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM resource_locks WHERE resource_address = $1 AND workspace_id = $2")
+            .bind(address)
+            .bind(workspace_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -472,12 +465,10 @@ impl StateBackend for PostgresBackend {
         let now = Self::now_dt();
 
         // Clean expired locks
-        sqlx::query(
-            "DELETE FROM resource_locks WHERE expires_at IS NOT NULL AND expires_at < $1",
-        )
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM resource_locks WHERE expires_at IS NOT NULL AND expires_at < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
 
         let row = sqlx::query(
             "SELECT resource_address, workspace_id, locked_at, locked_by, lock_id, operation, expires_at, info
@@ -592,13 +583,11 @@ impl StateBackend for PostgresBackend {
     }
 
     async fn clear_outputs(&self, workspace_id: &str, module_path: &str) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM resource_outputs WHERE workspace_id = $1 AND module_path = $2",
-        )
-        .bind(workspace_id)
-        .bind(module_path)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM resource_outputs WHERE workspace_id = $1 AND module_path = $2")
+            .bind(workspace_id)
+            .bind(module_path)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -700,7 +689,7 @@ impl StateBackend for PostgresBackend {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.iter().map(|r| run_from_row(r)).collect())
+        Ok(rows.iter().map(run_from_row).collect())
     }
 
     // ─── Query ──────────────────────────────────────────────────────────────

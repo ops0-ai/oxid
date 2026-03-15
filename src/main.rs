@@ -27,15 +27,15 @@ mod provider;
 mod state;
 
 use config::loader;
+use config::types::StateBackendConfig;
 use executor::engine::ResourceEngine;
 use provider::manager::ProviderManager;
-use config::types::StateBackendConfig;
 use state::backend::StateBackend;
 use state::models::{ResourceFilter, ResourceState};
-use state::query::{execute_query, QueryFormat};
-use state::sqlite::SqliteBackend;
 #[cfg(feature = "postgres")]
 use state::postgres::PostgresBackend;
+use state::query::{execute_query, QueryFormat};
+use state::sqlite::SqliteBackend;
 
 /// oxid - Standalone infrastructure engine
 #[derive(Parser)]
@@ -241,7 +241,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init => cmd_init(&cli).await,
-        Commands::Plan { ref target, json, refresh } => cmd_plan(&cli, target, json, refresh).await,
+        Commands::Plan {
+            ref target,
+            json,
+            refresh,
+        } => cmd_plan(&cli, target, json, refresh).await,
         Commands::Apply {
             ref target,
             auto_approve,
@@ -268,8 +272,7 @@ async fn main() -> Result<()> {
 
 fn resolve_backend_config() -> StateBackendConfig {
     if let Ok(url) = std::env::var("OXID_DATABASE_URL") {
-        let schema =
-            std::env::var("OXID_DATABASE_SCHEMA").unwrap_or_else(|_| "public".to_string());
+        let schema = std::env::var("OXID_DATABASE_SCHEMA").unwrap_or_else(|_| "public".to_string());
         StateBackendConfig::Postgres {
             connection_string: url,
             schema,
@@ -299,7 +302,7 @@ async fn open_backend(working_dir: &str) -> Result<Box<dyn StateBackend>> {
             connection_string,
             schema,
         } => {
-            let display_host = connection_string.split('@').last().unwrap_or("(hidden)");
+            let display_host = connection_string.split('@').next_back().unwrap_or("(hidden)");
             eprintln!(
                 "  {} Using {} backend ({}, schema: {})",
                 "→".blue(),
@@ -1132,7 +1135,8 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
         .context("No default workspace. Run 'oxid init' first.")?;
 
     // Collect attribute-level drift: (address, vec of (attr_name, stored_val, cloud_val))
-    let mut attribute_drifts: Vec<(String, Vec<(String, String, String)>)> = Vec::new();
+    type AttrDrift = (String, String, String);
+    let mut attribute_drifts: Vec<(String, Vec<AttrDrift>)> = Vec::new();
     let mut deleted_resources: Vec<String> = Vec::new();
 
     // Refresh from cloud to detect attribute-level drift
@@ -1169,7 +1173,11 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
 
             match engine
                 .provider_manager()
-                .read_resource(&resource.provider_source, &resource.resource_type, &padded_state)
+                .read_resource(
+                    &resource.provider_source,
+                    &resource.resource_type,
+                    &padded_state,
+                )
                 .await
             {
                 Ok(Some(cloud_state)) => {
@@ -1207,8 +1215,7 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
 
     // Resources in config (expanded for count/for_each)
     let var_defaults = executor::engine::build_variable_defaults(&workspace);
-    let mut config_addresses: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut config_addresses: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &workspace.resources {
         let base = format!("{}.{}", r.resource_type, r.name);
         if let Some(ref count_expr) = r.count {
@@ -1232,7 +1239,10 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
                 }
                 serde_json::Value::Array(arr) => {
                     for v in &arr {
-                        let key = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+                        let key = v
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| v.to_string());
                         config_addresses.insert(format!("{}[\"{}\"]", base, key));
                     }
                 }
@@ -1253,20 +1263,33 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
 
     // New in config, not in state
     for addr in config_addresses.difference(&state_addresses) {
-        drifts.push(("+".to_string(), addr.clone(), "new resource in config".to_string()));
+        drifts.push((
+            "+".to_string(),
+            addr.clone(),
+            "new resource in config".to_string(),
+        ));
     }
 
     // In state, not in config (or deleted from cloud)
     for addr in state_addresses.difference(&config_addresses) {
-        drifts.push(("-".to_string(), addr.clone(), "in state but not in config".to_string()));
+        drifts.push((
+            "-".to_string(),
+            addr.clone(),
+            "in state but not in config".to_string(),
+        ));
     }
 
     // Resources deleted from cloud
     for addr in &deleted_resources {
-        drifts.push(("-".to_string(), addr.clone(), "deleted outside of oxid".to_string()));
+        drifts.push((
+            "-".to_string(),
+            addr.clone(),
+            "deleted outside of oxid".to_string(),
+        ));
     }
 
-    let has_drift = !drifts.is_empty() || !attribute_drifts.is_empty() || !deleted_resources.is_empty();
+    let has_drift =
+        !drifts.is_empty() || !attribute_drifts.is_empty() || !deleted_resources.is_empty();
 
     if !has_drift {
         output::formatter::print_success("No drift detected. Infrastructure is in sync.");
@@ -1275,9 +1298,13 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
         println!();
         println!(
             "{}",
-            format!("Drift Detected ({} issue{})", total, if total == 1 { "" } else { "s" })
-                .bold()
-                .yellow()
+            format!(
+                "Drift Detected ({} issue{})",
+                total,
+                if total == 1 { "" } else { "s" }
+            )
+            .bold()
+            .yellow()
         );
         println!("{}", "─".repeat(70));
 
@@ -1293,7 +1320,12 @@ async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
 
         // Resources deleted from cloud
         for addr in &deleted_resources {
-            println!("  {} {} {}", "-".red(), addr.bold(), "deleted outside of oxid".red());
+            println!(
+                "  {} {} {}",
+                "-".red(),
+                addr.bold(),
+                "deleted outside of oxid".red()
+            );
         }
 
         // Attribute-level drift with values
@@ -1338,18 +1370,32 @@ fn diff_attributes(
     // Check attributes that exist in stored state
     for (key, stored_val) in stored_obj {
         // Skip computed/read-only metadata fields that providers populate
-        if key == "id" || key == "arn" || key.ends_with("_at")
-            || key.ends_with("_id") || key.ends_with("_arn") || key.ends_with("_arns")
-            || key == "owner_id" || key == "arn_suffix"
-            || key == "dns_name" || key == "zone_id"
-            || key.starts_with("private_") || key.starts_with("public_")
-            || key == "association_id" || key == "network_interface"
-            || key == "hosted_zone_id" || key == "domain_name"
-            || key == "main_route_table_id" || key == "default_route_table_id"
-            || key == "default_network_acl_id" || key == "default_security_group_id"
-            || key == "ipv6_association_id" || key == "ipv6_cidr_block_network_border_group"
-            || key == "instance_state" || key == "primary_network_interface_id"
-            || key.ends_with("_status") || key.ends_with("_state")
+        if key == "id"
+            || key == "arn"
+            || key.ends_with("_at")
+            || key.ends_with("_id")
+            || key.ends_with("_arn")
+            || key.ends_with("_arns")
+            || key == "owner_id"
+            || key == "arn_suffix"
+            || key == "dns_name"
+            || key == "zone_id"
+            || key.starts_with("private_")
+            || key.starts_with("public_")
+            || key == "association_id"
+            || key == "network_interface"
+            || key == "hosted_zone_id"
+            || key == "domain_name"
+            || key == "main_route_table_id"
+            || key == "default_route_table_id"
+            || key == "default_network_acl_id"
+            || key == "default_security_group_id"
+            || key == "ipv6_association_id"
+            || key == "ipv6_cidr_block_network_border_group"
+            || key == "instance_state"
+            || key == "primary_network_interface_id"
+            || key.ends_with("_status")
+            || key.ends_with("_state")
         {
             continue;
         }
@@ -1360,9 +1406,7 @@ fn diff_attributes(
                     (stored_val.as_object(), cloud_val.as_object())
                 {
                     for (sub_key, sub_stored) in stored_map {
-                        let sub_cloud = cloud_map
-                            .get(sub_key)
-                            .unwrap_or(&serde_json::Value::Null);
+                        let sub_cloud = cloud_map.get(sub_key).unwrap_or(&serde_json::Value::Null);
                         if !json_values_equal(sub_stored, sub_cloud) {
                             changed.push((
                                 format!("{}.{}", key, sub_key),
@@ -1471,8 +1515,7 @@ fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
         }
         (Value::Object(a), Value::Object(b)) => {
             // Compare all keys from both sides
-            let all_keys: std::collections::HashSet<&String> =
-                a.keys().chain(b.keys()).collect();
+            let all_keys: std::collections::HashSet<&String> = a.keys().chain(b.keys()).collect();
             for key in all_keys {
                 let val_a = a.get(key).unwrap_or(&Value::Null);
                 let val_b = b.get(key).unwrap_or(&Value::Null);
