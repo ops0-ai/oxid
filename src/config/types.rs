@@ -54,6 +54,14 @@ pub enum StateBackendConfig {
     },
 }
 
+impl Default for StateBackendConfig {
+    fn default() -> Self {
+        StateBackendConfig::Sqlite {
+            path: "oxid.db".to_string(),
+        }
+    }
+}
+
 // ─── Workspace (the collection of all infrastructure in scope) ──────────────
 
 /// A workspace holds all providers, resources, modules, variables, and outputs.

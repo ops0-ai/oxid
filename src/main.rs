@@ -29,10 +29,13 @@ mod state;
 use config::loader;
 use executor::engine::ResourceEngine;
 use provider::manager::ProviderManager;
+use config::types::StateBackendConfig;
 use state::backend::StateBackend;
 use state::models::{ResourceFilter, ResourceState};
 use state::query::{execute_query, QueryFormat};
 use state::sqlite::SqliteBackend;
+#[cfg(feature = "postgres")]
+use state::postgres::PostgresBackend;
 
 /// oxid - Standalone infrastructure engine
 #[derive(Parser)]
@@ -72,6 +75,10 @@ enum Commands {
         /// Output as JSON (machine-parseable)
         #[arg(long)]
         json: bool,
+
+        /// Refresh state from cloud providers before planning (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        refresh: bool,
     },
 
     /// Apply infrastructure changes with resource-level parallelism
@@ -234,7 +241,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init => cmd_init(&cli).await,
-        Commands::Plan { ref target, json } => cmd_plan(&cli, target, json).await,
+        Commands::Plan { ref target, json, refresh } => cmd_plan(&cli, target, json, refresh).await,
         Commands::Apply {
             ref target,
             auto_approve,
@@ -259,9 +266,55 @@ async fn main() -> Result<()> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn open_backend(working_dir: &str) -> Result<SqliteBackend> {
-    let db_path = format!("{}/oxid.db", working_dir);
-    SqliteBackend::open(&db_path)
+fn resolve_backend_config() -> StateBackendConfig {
+    if let Ok(url) = std::env::var("OXID_DATABASE_URL") {
+        let schema =
+            std::env::var("OXID_DATABASE_SCHEMA").unwrap_or_else(|_| "public".to_string());
+        StateBackendConfig::Postgres {
+            connection_string: url,
+            schema,
+        }
+    } else {
+        StateBackendConfig::Sqlite {
+            path: "oxid.db".to_string(),
+        }
+    }
+}
+
+async fn open_backend(working_dir: &str) -> Result<Box<dyn StateBackend>> {
+    let config = resolve_backend_config();
+    match config {
+        StateBackendConfig::Sqlite { path } => {
+            let db_path = format!("{}/{}", working_dir, path);
+            eprintln!(
+                "  {} Using {} backend ({})",
+                "→".blue(),
+                "SQLite".bold(),
+                db_path
+            );
+            Ok(Box::new(SqliteBackend::open(&db_path)?))
+        }
+        #[cfg(feature = "postgres")]
+        StateBackendConfig::Postgres {
+            connection_string,
+            schema,
+        } => {
+            let display_host = connection_string.split('@').last().unwrap_or("(hidden)");
+            eprintln!(
+                "  {} Using {} backend ({}, schema: {})",
+                "→".blue(),
+                "PostgreSQL".bold(),
+                display_host.split('?').next().unwrap_or(display_host),
+                schema
+            );
+            let backend = PostgresBackend::connect(&connection_string, &schema).await?;
+            Ok(Box::new(backend))
+        }
+        #[cfg(not(feature = "postgres"))]
+        StateBackendConfig::Postgres { .. } => {
+            bail!("PostgreSQL backend requires the 'postgres' feature. Rebuild with: cargo build --features postgres")
+        }
+    }
 }
 
 fn provider_manager(working_dir: &str) -> ProviderManager {
@@ -280,7 +333,7 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
     std::fs::create_dir_all(format!("{}/providers", working_dir))?;
 
     // Initialize state database
-    let backend = open_backend(working_dir)?;
+    let backend = open_backend(working_dir).await?;
     backend.initialize().await?;
 
     // Create default workspace
@@ -335,11 +388,134 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
         }
     }
 
+    // Auto-import existing Terraform state if present
+    let ws = backend
+        .get_workspace(DEFAULT_WORKSPACE)
+        .await?
+        .context("Default workspace missing after init")?;
+    let existing_count = backend.count_resources(&ws.id).await?;
+
+    if existing_count == 0 {
+        // 1. Check for local terraform.tfstate
+        let local_tfstate = config_path.join("terraform.tfstate");
+        let local_tfstate = if local_tfstate.exists() {
+            Some(local_tfstate)
+        } else if Path::new("terraform.tfstate").exists() {
+            Some(Path::new("terraform.tfstate").to_path_buf())
+        } else {
+            None
+        };
+
+        if let Some(tfstate_path) = local_tfstate {
+            println!();
+            println!(
+                "  {} Found existing Terraform state: {}",
+                "→".blue(),
+                tfstate_path.display()
+            );
+            match std::fs::read_to_string(&tfstate_path) {
+                Ok(state_json) => {
+                    let result = backend.import_tfstate(&ws.id, &state_json).await?;
+                    println!(
+                        "  {} Imported {} resource(s) from local tfstate",
+                        "✓".green().bold(),
+                        result.imported
+                    );
+                    if result.skipped > 0 {
+                        println!(
+                            "  {} Skipped {} (already exist)",
+                            "!".yellow(),
+                            result.skipped
+                        );
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "  {} Could not read {}: {}",
+                        "!".yellow(),
+                        tfstate_path.display(),
+                        e
+                    );
+                }
+            }
+        } else {
+            // 2. Try to detect remote backend from .tf files and fetch state
+            if let Ok(workspace_config) = crate::hcl::parse_directory(config_path) {
+                if let Some(remote_backend) = workspace_config
+                    .terraform_settings
+                    .as_ref()
+                    .and_then(|ts| ts.backend.as_ref())
+                {
+                    println!();
+                    match remote_backend {
+                        crate::config::types::BackendConfig::S3 {
+                            bucket,
+                            key,
+                            region,
+                            ..
+                        } => {
+                            println!(
+                                "  {} Detected Terraform S3 backend: s3://{}/{}",
+                                "→".blue(),
+                                bucket,
+                                key
+                            );
+                            println!("{}", "  Fetching remote state...".dimmed());
+                            match crate::state::remote::fetch_remote_state(remote_backend).await {
+                                Ok(state_json) => {
+                                    let result =
+                                        backend.import_tfstate(&ws.id, &state_json).await?;
+                                    println!(
+                                        "  {} Imported {} resource(s) from S3 backend (region: {})",
+                                        "✓".green().bold(),
+                                        result.imported,
+                                        region.as_deref().unwrap_or("default")
+                                    );
+                                    if result.skipped > 0 {
+                                        println!(
+                                            "  {} Skipped {} (already exist)",
+                                            "!".yellow(),
+                                            result.skipped
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "  {} Could not fetch remote state: {}",
+                                        "!".yellow(),
+                                        e
+                                    );
+                                    println!(
+                                        "  {}",
+                                        "You can import manually later: oxid import tfstate"
+                                            .dimmed()
+                                    );
+                                }
+                            }
+                        }
+                        crate::config::types::BackendConfig::Unsupported { backend_type } => {
+                            println!(
+                                "  {} Detected Terraform {} backend (auto-import not supported yet)",
+                                "!".yellow(),
+                                backend_type
+                            );
+                            println!(
+                                "  {}",
+                                "Export manually: terraform state pull > terraform.tfstate && oxid import tfstate terraform.tfstate"
+                                    .dimmed()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     output::formatter::print_success("Project initialized successfully.");
     Ok(())
 }
 
-async fn cmd_plan(cli: &Cli, targets: &[String], json: bool) -> Result<()> {
+async fn cmd_plan(cli: &Cli, targets: &[String], json: bool, refresh: bool) -> Result<()> {
     let workspace = loader::load_workspace(Path::new(&cli.config))?;
 
     // Validate count/for_each references before planning
@@ -349,7 +525,7 @@ async fn cmd_plan(cli: &Cli, targets: &[String], json: bool) -> Result<()> {
         bail!("Validation failed.");
     }
 
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     let ws = backend
@@ -360,7 +536,7 @@ async fn cmd_plan(cli: &Cli, targets: &[String], json: bool) -> Result<()> {
     let pm = Arc::new(provider_manager(&cli.working_dir));
     let engine = ResourceEngine::new(pm, cli.parallelism);
 
-    let plan = engine.plan(&workspace, &backend, &ws.id).await?;
+    let plan = engine.plan(&workspace, &*backend, &ws.id, refresh).await?;
     engine.shutdown().await?;
 
     if json {
@@ -381,7 +557,7 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
         bail!("Validation failed.");
     }
 
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     let ws = backend
@@ -393,7 +569,7 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
     let engine = ResourceEngine::new(pm, cli.parallelism);
 
     // Plan first
-    let plan = engine.plan(&workspace, &backend, &ws.id).await?;
+    let plan = engine.plan(&workspace, &*backend, &ws.id, true).await?;
     output::formatter::print_resource_plan(&plan, targets);
 
     if plan.creates == 0 && plan.updates == 0 && plan.deletes == 0 && plan.replaces == 0 {
@@ -430,7 +606,7 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
         .await?;
 
     // Apply
-    let backend_arc: Arc<dyn StateBackend> = Arc::new(backend);
+    let backend_arc: Arc<dyn StateBackend> = Arc::from(backend);
     let summary = engine
         .apply(&workspace, Arc::clone(&backend_arc), &ws.id, &plan)
         .await?;
@@ -496,7 +672,7 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
 
 async fn cmd_destroy(cli: &Cli, _targets: &[String], auto_approve: bool) -> Result<()> {
     let workspace = loader::load_workspace(Path::new(&cli.config))?;
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     let ws = backend
@@ -551,7 +727,7 @@ async fn cmd_destroy(cli: &Cli, _targets: &[String], auto_approve: bool) -> Resu
         .start_run(&ws.id, "destroy", resource_count as i32)
         .await?;
 
-    let backend_arc: Arc<dyn StateBackend> = Arc::new(backend);
+    let backend_arc: Arc<dyn StateBackend> = Arc::from(backend);
     let summary = engine
         .destroy(&workspace, Arc::clone(&backend_arc), &ws.id)
         .await?;
@@ -580,7 +756,7 @@ async fn cmd_destroy(cli: &Cli, _targets: &[String], auto_approve: bool) -> Resu
 }
 
 async fn cmd_state(cli: &Cli, command: &StateCommands) -> Result<()> {
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     let ws = backend
@@ -666,7 +842,7 @@ async fn cmd_state(cli: &Cli, command: &StateCommands) -> Result<()> {
 }
 
 async fn cmd_import(cli: &Cli, command: &ImportCommands) -> Result<()> {
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     let ws = backend
@@ -795,17 +971,17 @@ async fn cmd_import(cli: &Cli, command: &ImportCommands) -> Result<()> {
 }
 
 async fn cmd_query(cli: &Cli, sql: &str, format: &str) -> Result<()> {
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     let fmt = QueryFormat::parse(format);
-    let result = execute_query(&backend, sql, fmt).await?;
+    let result = execute_query(&*backend, sql, fmt).await?;
     println!("{}", result);
     Ok(())
 }
 
 async fn cmd_workspace(cli: &Cli, command: &WorkspaceCommands) -> Result<()> {
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     match command {
@@ -893,7 +1069,7 @@ async fn cmd_graph(cli: &Cli, graph_type: &str) -> Result<()> {
 }
 
 async fn cmd_providers(cli: &Cli) -> Result<()> {
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     let ws = backend
@@ -947,7 +1123,7 @@ async fn cmd_providers(cli: &Cli) -> Result<()> {
 
 async fn cmd_drift(cli: &Cli, refresh: bool) -> Result<()> {
     let workspace = loader::load_workspace(Path::new(&cli.config))?;
-    let backend = open_backend(&cli.working_dir)?;
+    let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
 
     let ws = backend

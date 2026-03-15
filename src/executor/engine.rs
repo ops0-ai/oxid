@@ -169,12 +169,14 @@ impl ResourceEngine {
     }
 
     /// Plan all resources in the workspace.
-    /// Returns a summary of what would change.
+    /// When `refresh` is true, reads each resource from the cloud provider (detects drift, slower).
+    /// When `refresh` is false, uses cached state from the database (fast).
     pub async fn plan(
         &self,
         workspace: &WorkspaceConfig,
         backend: &dyn StateBackend,
         workspace_id: &str,
+        refresh: bool,
     ) -> Result<PlanSummary> {
         let provider_map = build_provider_map(workspace);
         let var_defaults = build_variable_defaults(workspace);
@@ -231,10 +233,15 @@ impl ResourceEngine {
                     ..
                 } => {
                     planned_count += 1;
+                    let status_msg = if refresh {
+                        "Refreshing state..."
+                    } else {
+                        "Planning..."
+                    };
                     println!(
                         "{}: {} [{}/{}]",
                         address,
-                        "Refreshing state...".dimmed(),
+                        status_msg.dimmed(),
                         planned_count,
                         total_resources,
                     );
@@ -288,26 +295,32 @@ impl ResourceEngine {
                     };
 
                     // Refresh: call ReadResource to get actual cloud state
-                    let prior_state = if let Some(ref padded) = prior_state_padded {
-                        match pm
-                            .read_resource(provider_source, resource_type, padded)
-                            .await
-                        {
-                            Ok(Some(refreshed)) => {
-                                // Update shared resource_states for cross-refs
-                                resource_states.insert(address.clone(), refreshed.clone());
-                                Some(refreshed)
+                    let prior_state = if refresh {
+                        if let Some(ref padded) = prior_state_padded {
+                            match pm
+                                .read_resource(provider_source, resource_type, padded)
+                                .await
+                            {
+                                Ok(Some(refreshed)) => {
+                                    resource_states.insert(address.clone(), refreshed.clone());
+                                    Some(refreshed)
+                                }
+                                Ok(None) => {
+                                    let _ = backend.delete_resource(&ws_id, address).await;
+                                    resource_states.remove(address);
+                                    None
+                                }
+                                Err(_) => prior_state_padded.clone(),
                             }
-                            Ok(None) => {
-                                // Resource was deleted outside of oxid
-                                let _ = backend.delete_resource(&ws_id, address).await;
-                                resource_states.remove(address);
-                                None
-                            }
-                            Err(_) => prior_state_padded.clone(),
+                        } else {
+                            None
                         }
                     } else {
-                        None
+                        // --refresh=false: use cached state from DB directly
+                        if let Some(ref padded) = prior_state_padded {
+                            resource_states.insert(address.clone(), padded.clone());
+                        }
+                        prior_state_padded.clone()
                     };
 
                     let plan_result = match pm

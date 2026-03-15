@@ -28,8 +28,10 @@ Oxid parses `.tf` (HCL) and `.tf.json` files natively and communicates directly 
 - Resource-level plan display (Terraform-style `+`, `~`, `-`, `-/+`)
 - SQLite state backend with full SQL query support
 - .tfvars and TF_VAR_ environment variable support
+- PostgreSQL remote state backend with JSONB, TIMESTAMPTZ, GIN indexes
 - Drift detection with `oxid drift`
-- Import from existing .tfstate files
+- Import from existing .tfstate files (auto-detected on `oxid init`)
+- `--refresh=false` for fast plan using cached state
 
 ## Quick Start
 
@@ -67,6 +69,9 @@ git clone https://github.com/ops0-ai/oxid.git
 cd oxid
 cargo build --release
 # Binary at ./target/release/oxid
+
+# With PostgreSQL remote state support
+cargo build --release --features postgres
 ```
 
 ### Usage
@@ -92,6 +97,9 @@ oxid state show aws_vpc.main
 
 # Query state with SQL
 oxid query "SELECT address, resource_type, status FROM resources"
+
+# Fast plan (skip cloud API refresh, use cached state)
+oxid plan --refresh=false
 
 # Detect drift
 oxid drift
@@ -170,7 +178,7 @@ Apply complete! Resources: 2 added, 0 changed, 0 destroyed. Total time: 4s.
 3. **Start Providers** — Downloads provider binaries from registry.terraform.io, starts them as subprocesses, connects via gRPC
 4. **Plan** — Calls `PlanResourceChange` on each provider to compute diffs
 5. **Apply** — Event-driven DAG walker executes resources as dependencies are satisfied, calling `ApplyResourceChange` via gRPC
-6. **Store State** — Persists resource attributes to SQLite database
+6. **Store State** — Persists resource attributes to SQLite (local) or PostgreSQL (remote)
 
 ## Architecture
 
@@ -190,8 +198,72 @@ Apply complete! Resources: 2 added, 0 changed, 0 destroyed. Total time: 4s.
                |          |          |
             [AWS]      [GCP]     [Azure]
                         |
-                  [SQLite State]
+            [SQLite / PostgreSQL State]
 ```
+
+## PostgreSQL Remote State
+
+By default, oxid stores state in a local SQLite database. For team collaboration, you can use PostgreSQL as a remote state backend.
+
+### Setup
+
+```bash
+# Build with PostgreSQL support
+cargo build --release --features postgres
+
+# Set the database URL (supports Amazon RDS, Supabase, Neon, or any PostgreSQL)
+export OXID_DATABASE_URL="postgres://user:password@hostname:5432/dbname"
+
+# Initialize — tables are created automatically
+oxid init
+```
+
+When `OXID_DATABASE_URL` is set, oxid automatically uses PostgreSQL. When unset, it falls back to SQLite.
+
+### Schema
+
+The PostgreSQL backend uses native Postgres types for performance and queryability:
+
+| Column | Type | Purpose |
+|---|---|---|
+| `attributes_json` | `JSONB` | Resource attributes (GIN-indexed) |
+| `sensitive_attrs` | `JSONB` | Sensitive attribute keys (GIN-indexed) |
+| `created_at`, `updated_at` | `TIMESTAMPTZ` | Timestamps with timezone |
+| `sensitive` | `BOOLEAN` | Output sensitivity flag |
+
+### Querying
+
+JSONB enables powerful queries against your infrastructure state:
+
+```sql
+-- Count resources by type
+oxid query "SELECT resource_type, COUNT(*) FROM resources GROUP BY resource_type"
+
+-- Find all VPCs by CIDR
+oxid query "SELECT address, attributes_json->>'cidr_block' AS cidr FROM resources WHERE resource_type = 'aws_vpc'"
+
+-- Find resources with a specific tag
+oxid query "SELECT address FROM resources WHERE attributes_json->'tags'->>'Environment' = 'production'"
+
+-- Find all t3.micro instances
+oxid query "SELECT address FROM resources WHERE attributes_json @> '{\"instance_type\": \"t3.micro\"}'"
+```
+
+### Auto-Import from Terraform
+
+When you run `oxid init` in a directory with existing Terraform state, oxid automatically detects and imports it:
+
+```bash
+# Auto-detects local terraform.tfstate
+oxid init
+
+# Also detects remote S3 backends configured in your .tf files
+# and downloads + imports the state automatically
+```
+
+### TLS / RDS
+
+Connections to Amazon RDS and other TLS-requiring hosts work out of the box (built with `rustls`).
 
 ## Building
 

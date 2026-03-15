@@ -1,6 +1,6 @@
 [package]
 name = "oxid"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Standalone infrastructure-as-code engine — OSS alternative to Terraform/OpenTofu"
 license = "Apache-2.0"
@@ -30,7 +30,7 @@ petgraph = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # State storage - PostgreSQL (feature-gated)
-sqlx = { version = "0.8.1", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"], optional = true }
+sqlx = { version = "0.8.1", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "uuid"], optional = true }
 
 # Concurrent data structures
 dashmap = "6"

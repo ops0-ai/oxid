@@ -2,6 +2,10 @@ pub mod backend;
 pub mod lock;
 pub mod migration;
 pub mod models;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres_schema;
 pub mod query;
 pub mod remote;
 pub mod schema;
