@@ -78,7 +78,7 @@ aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 
 [features]
-default = ["sqlite", "s3-backend"]
+default = ["sqlite", "postgres", "s3-backend"]
 sqlite = []
 postgres = ["sqlx"]
 s3-backend = ["aws-sdk-s3", "aws-config"]

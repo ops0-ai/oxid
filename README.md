@@ -76,10 +76,7 @@ From source:
 git clone https://github.com/ops0-ai/oxid.git
 cd oxid
 cargo build --release
-# Binary at ./target/release/oxid
-
-# With PostgreSQL remote state support
-cargo build --release --features postgres
+# Binary at ./target/release/oxid (includes SQLite + PostgreSQL + S3 import)
 ```
 
 ### Usage
@@ -216,9 +213,6 @@ By default, oxid stores state in a local SQLite database. For team collaboration
 ### Setup
 
 ```bash
-# Build with PostgreSQL support
-cargo build --release --features postgres
-
 # Set the database URL (supports Amazon RDS, Supabase, Neon, or any PostgreSQL)
 export OXID_DATABASE_URL="postgres://user:password@hostname:5432/dbname"
 
