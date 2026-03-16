@@ -73,23 +73,16 @@ pub struct PlanSummary {
 
 impl std::fmt::Display for PlanSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts = Vec::new();
-        if self.creates > 0 {
-            parts.push(format!("{} to add", self.creates));
-        }
-        if self.replaces > 0 {
-            parts.push(format!("{} to replace", self.replaces));
-        }
-        if self.updates > 0 {
-            parts.push(format!("{} to change", self.updates));
-        }
-        if self.deletes > 0 {
-            parts.push(format!("{} to destroy", self.deletes));
-        }
-        if parts.is_empty() {
+        if self.creates == 0 && self.updates == 0 && self.deletes == 0 && self.replaces == 0 {
             write!(f, "No changes.")
         } else {
-            write!(f, "Plan: {}.", parts.join(", "))
+            write!(
+                f,
+                "Plan: {} to add, {} to change, {} to destroy.",
+                self.creates,
+                self.updates + self.replaces,
+                self.deletes
+            )
         }
     }
 }
