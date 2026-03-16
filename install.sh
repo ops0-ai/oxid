@@ -20,7 +20,15 @@ case "$ARCH" in
   *) echo "Error: Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
 
-ARTIFACT="oxid-${OS}-${ARCH}"
+# Detect musl (Alpine, Void, etc.) vs glibc
+LIBC=""
+if [ "$OS" = "linux" ]; then
+  if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then
+    LIBC="-musl"
+  fi
+fi
+
+ARTIFACT="oxid-${OS}${LIBC}-${ARCH}"
 
 # Get latest version
 echo "Fetching latest oxid release..."

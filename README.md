@@ -60,6 +60,14 @@ sudo mv oxid /usr/local/bin/
 # Linux (ARM64)
 curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-linux-arm64.tar.gz | tar xz
 sudo mv oxid /usr/local/bin/
+
+# Alpine / musl (x86_64)
+curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-linux-musl-amd64.tar.gz | tar xz
+sudo mv oxid /usr/local/bin/
+
+# Alpine / musl (ARM64)
+curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-linux-musl-arm64.tar.gz | tar xz
+sudo mv oxid /usr/local/bin/
 ```
 
 From source:
