@@ -21,21 +21,27 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: oxid-linux-amd64
+            use_cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: oxid-linux-arm64
+            use_cross: false
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact: oxid-linux-musl-amd64
+            use_cross: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             artifact: oxid-linux-musl-arm64
+            use_cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: oxid-darwin-amd64
+            use_cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: oxid-darwin-arm64
+            use_cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -76,21 +82,9 @@ jobs:
           echo "OPENSSL_LIB_DIR=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
-      - name: Install cross-compilation tools (x86_64-musl)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install cross-compilation tools (aarch64-musl)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
-          # Install aarch64 musl cross-compiler
-          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> $GITHUB_ENV
+      - name: Install cross (musl targets)
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
@@ -102,8 +96,13 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Build
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross - musl)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
