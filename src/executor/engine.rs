@@ -14,7 +14,7 @@ use crate::provider::manager::ProviderManager;
 use crate::state::backend::StateBackend;
 
 /// The action to take for a resource.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResourceAction {
     Create,
     Update,
@@ -38,7 +38,7 @@ impl std::fmt::Display for ResourceAction {
 }
 
 /// A planned change for a single resource.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct PlannedChange {
     pub address: String,
     pub action: ResourceAction,
@@ -52,7 +52,7 @@ pub struct PlannedChange {
 }
 
 /// A planned output change.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct PlannedOutput {
     pub name: String,
     pub action: ResourceAction,
@@ -60,7 +60,7 @@ pub struct PlannedOutput {
 }
 
 /// Summary of a plan operation.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct PlanSummary {
     pub changes: Vec<PlannedChange>,
     pub outputs: Vec<PlannedOutput>,
@@ -360,6 +360,41 @@ impl ResourceEngine {
                     ..
                 } => {
                     planned_count += 1;
+
+                    // --refresh=false: skip data source cloud reads, use cached state
+                    if !refresh {
+                        // Check if we already have cached state for this data source
+                        if let Some(cached) = resource_states.get(address) {
+                            println!(
+                                "{}: {} [{}/{}]",
+                                address,
+                                "Using cached state".dimmed(),
+                                planned_count,
+                                total_resources,
+                            );
+                            changes.push(PlannedChange {
+                                address: address.clone(),
+                                action: ResourceAction::Read,
+                                resource_type: resource_type.clone(),
+                                provider_source: provider_source.clone(),
+                                planned_state: Some(cached.clone()),
+                                prior_state: None,
+                                user_config: None,
+                                requires_replace: vec![],
+                                planned_private: vec![],
+                            });
+                        } else {
+                            println!(
+                                "{}: {} [{}/{}]",
+                                address,
+                                "Skipped (no cached state, use --refresh to read)".dimmed(),
+                                planned_count,
+                                total_resources,
+                            );
+                        }
+                        continue;
+                    }
+
                     println!(
                         "{}: {} [{}/{}]",
                         address,

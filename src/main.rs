@@ -79,6 +79,20 @@ enum Commands {
         /// Refresh state from cloud providers before planning (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         refresh: bool,
+
+        /// Save plan to a file for later use with `oxid show` or `oxid apply`
+        #[arg(long = "out")]
+        out_file: Option<String>,
+    },
+
+    /// Show a saved plan file (from `oxid plan -out=<file>`)
+    Show {
+        /// Path to saved plan file
+        plan_file: String,
+
+        /// Output as JSON (machine-parseable)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Apply infrastructure changes with resource-level parallelism
@@ -245,7 +259,12 @@ async fn main() -> Result<()> {
             ref target,
             json,
             refresh,
-        } => cmd_plan(&cli, target, json, refresh).await,
+            ref out_file,
+        } => cmd_plan(&cli, target, json, refresh, out_file.as_deref()).await,
+        Commands::Show {
+            ref plan_file,
+            json,
+        } => cmd_show(plan_file, json),
         Commands::Apply {
             ref target,
             auto_approve,
@@ -521,7 +540,13 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_plan(cli: &Cli, targets: &[String], json: bool, refresh: bool) -> Result<()> {
+async fn cmd_plan(
+    cli: &Cli,
+    targets: &[String],
+    json: bool,
+    refresh: bool,
+    out_file: Option<&str>,
+) -> Result<()> {
     let workspace = loader::load_workspace(Path::new(&cli.config))?;
 
     // Validate count/for_each references before planning
@@ -545,10 +570,38 @@ async fn cmd_plan(cli: &Cli, targets: &[String], json: bool, refresh: bool) -> R
     let plan = engine.plan(&workspace, &*backend, &ws.id, refresh).await?;
     engine.shutdown().await?;
 
+    // Save plan to file if -out is specified
+    if let Some(path) = out_file {
+        let plan_json = serde_json::to_vec(&plan).context("Failed to serialize plan")?;
+        std::fs::write(path, &plan_json).context(format!("Failed to write plan file: {}", path))?;
+        println!(
+            "\nSaved plan to {}. To view: {} or {}",
+            path.bold(),
+            format!("oxid show {}", path).cyan(),
+            format!("oxid show -json {}", path).cyan(),
+        );
+    }
+
     if json {
         output::formatter::print_plan_json(&plan);
     } else {
         output::formatter::print_resource_plan(&plan, targets);
+    }
+    Ok(())
+}
+
+fn cmd_show(plan_file: &str, json: bool) -> Result<()> {
+    use executor::engine::PlanSummary;
+
+    let data =
+        std::fs::read(plan_file).context(format!("Failed to read plan file: {}", plan_file))?;
+    let plan: PlanSummary = serde_json::from_slice(&data)
+        .context(format!("Failed to parse plan file: {}", plan_file))?;
+
+    if json {
+        output::formatter::print_plan_json(&plan);
+    } else {
+        output::formatter::print_resource_plan(&plan, &[]);
     }
     Ok(())
 }
