@@ -445,6 +445,16 @@ fn parse_address(address: &str) -> (&str, &str) {
     }
 }
 
+/// Normalize provider source to full registry path.
+/// e.g. "hashicorp/aws" → "registry.terraform.io/hashicorp/aws"
+fn normalize_provider_name(source: &str) -> String {
+    if source.contains('/') && !source.contains("registry.terraform.io") {
+        format!("registry.terraform.io/{}", source)
+    } else {
+        source.to_string()
+    }
+}
+
 /// Print the plan as Terraform-compatible JSON (matches `terraform show -json tfplan`).
 pub fn print_plan_json(plan: &PlanSummary) {
     let version = env!("CARGO_PKG_VERSION");
@@ -462,13 +472,14 @@ pub fn print_plan_json(plan: &PlanSummary) {
                 "managed"
             };
             let actions = action_to_tf_actions(&c.action);
+            let provider_name = normalize_provider_name(&c.provider_source);
 
             serde_json::json!({
                 "address": c.address,
                 "mode": mode,
                 "type": resource_type,
                 "name": name,
-                "provider_name": c.provider_source,
+                "provider_name": provider_name,
                 "change": {
                     "actions": actions,
                     "before": c.prior_state,
@@ -477,8 +488,8 @@ pub fn print_plan_json(plan: &PlanSummary) {
                         c.planned_state.as_ref(),
                         c.user_config.as_ref(),
                     ),
-                    "before_sensitive": {},
-                    "after_sensitive": {},
+                    "before_sensitive": serde_json::json!({}),
+                    "after_sensitive": serde_json::json!({}),
                 }
             })
         })
@@ -491,25 +502,41 @@ pub fn print_plan_json(plan: &PlanSummary) {
         .filter(|c| {
             matches!(
                 c.action,
-                ResourceAction::Create | ResourceAction::Update | ResourceAction::Replace
+                ResourceAction::Create
+                    | ResourceAction::Update
+                    | ResourceAction::Replace
+                    | ResourceAction::NoOp
             )
         })
         .map(|c| {
             let (resource_type, name) = parse_address(&c.address);
+            let provider_name = normalize_provider_name(&c.provider_source);
             serde_json::json!({
                 "address": c.address,
                 "mode": "managed",
                 "type": resource_type,
                 "name": name,
-                "provider_name": c.provider_source,
+                "provider_name": provider_name,
                 "schema_version": 0,
                 "values": c.planned_state,
-                "sensitive_values": {},
+                "sensitive_values": serde_json::json!({}),
             })
         })
         .collect();
 
-    // Build output_changes
+    // Build planned_values.outputs
+    let mut planned_outputs = serde_json::Map::new();
+    for output in &plan.outputs {
+        planned_outputs.insert(
+            output.name.clone(),
+            serde_json::json!({
+                "sensitive": false,
+                "value": null,
+            }),
+        );
+    }
+
+    // Build output_changes (Terraform format: map of name → change object)
     let mut output_changes = serde_json::Map::new();
     for output in &plan.outputs {
         let actions = action_to_tf_actions(&output.action);
@@ -518,27 +545,32 @@ pub fn print_plan_json(plan: &PlanSummary) {
             serde_json::json!({
                 "actions": actions,
                 "before": null,
+                "after": null,
                 "after_unknown": !output.value_known,
                 "after_sensitive": false,
+                "before_sensitive": false,
             }),
         );
     }
 
+    // Build variables map
+    let variables = serde_json::json!({});
+
     let json = serde_json::json!({
         "format_version": "1.2",
-        "oxid_version": version,
+        "terraform_version": format!("oxid-{}", version),
+        "applyable": plan.creates > 0 || plan.updates > 0 || plan.deletes > 0 || plan.replaces > 0,
+        "complete": true,
+        "errored": false,
+        "variables": variables,
         "planned_values": {
+            "outputs": planned_outputs,
             "root_module": {
                 "resources": planned_resources,
             }
         },
         "resource_changes": resource_changes,
         "output_changes": output_changes,
-        "summary": {
-            "add": plan.creates,
-            "change": plan.updates + plan.replaces,
-            "destroy": plan.deletes,
-        }
     });
 
     println!(
