@@ -567,7 +567,9 @@ async fn cmd_plan(
     let pm = Arc::new(provider_manager(&cli.working_dir));
     let engine = ResourceEngine::new(pm, cli.parallelism);
 
-    let plan = engine.plan(&workspace, &*backend, &ws.id, refresh).await?;
+    let plan = engine
+        .plan(&workspace, &*backend, &ws.id, refresh, targets)
+        .await?;
     engine.shutdown().await?;
 
     // Save plan to file if -out is specified
@@ -628,8 +630,10 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
     let engine = ResourceEngine::new(pm, cli.parallelism);
 
     // Plan first
-    let plan = engine.plan(&workspace, &*backend, &ws.id, true).await?;
-    output::formatter::print_resource_plan(&plan, targets);
+    let plan = engine
+        .plan(&workspace, &*backend, &ws.id, true, targets)
+        .await?;
+    output::formatter::print_resource_plan(&plan, &[]);
 
     if plan.creates == 0 && plan.updates == 0 && plan.deletes == 0 && plan.replaces == 0 {
         println!("\n{}", "No changes. Infrastructure is up-to-date.".green());

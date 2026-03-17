@@ -164,12 +164,14 @@ impl ResourceEngine {
     /// Plan all resources in the workspace.
     /// When `refresh` is true, reads each resource from the cloud provider (detects drift, slower).
     /// When `refresh` is false, uses cached state from the database (fast).
+    /// When `targets` is non-empty, only plan those resources and their transitive dependencies.
     pub async fn plan(
         &self,
         workspace: &WorkspaceConfig,
         backend: &dyn StateBackend,
         workspace_id: &str,
         refresh: bool,
+        targets: &[String],
     ) -> Result<PlanSummary> {
         let provider_map = build_provider_map(workspace);
         let var_defaults = build_variable_defaults(workspace);
@@ -181,6 +183,31 @@ impl ResourceEngine {
 
         let pm = Arc::clone(&self.provider_manager);
         let ws_id = workspace_id.to_string();
+
+        // Build target filter: targeted resources + all transitive dependencies
+        let target_indices: Option<std::collections::HashSet<petgraph::graph::NodeIndex>> =
+            if targets.is_empty() {
+                None // No filter — plan everything
+            } else {
+                let mut included = std::collections::HashSet::new();
+                // Find target nodes
+                for idx in graph.node_indices() {
+                    let addr = graph[idx].address();
+                    let base = graph[idx].base_address();
+                    if targets.iter().any(|t| addr == t || base == t) {
+                        collect_dependencies(&graph, idx, &mut included);
+                    }
+                }
+                if included.is_empty() {
+                    println!(
+                        "{}",
+                        "Warning: no resources matched the given -target addresses."
+                            .yellow()
+                            .bold()
+                    );
+                }
+                Some(included)
+            };
 
         // Pre-load existing resource states so cross-resource references resolve during plan
         let resource_states = Arc::new(DashMap::new());
@@ -206,15 +233,22 @@ impl ResourceEngine {
         let mut changes = Vec::new();
         let mut outputs = Vec::new();
 
-        // Count resources for progress
+        // Count resources for progress (only targeted ones if filtered)
         let total_resources = graph
             .node_indices()
             .filter(|&idx| !matches!(graph[idx], DagNode::Output { .. }))
+            .filter(|idx| target_indices.as_ref().map_or(true, |t| t.contains(idx)))
             .count();
         let mut planned_count = 0;
 
         // Walk the graph to plan each resource
         for idx in graph.node_indices() {
+            // Skip nodes not in target set
+            if let Some(ref targets) = target_indices {
+                if !targets.contains(&idx) {
+                    continue;
+                }
+            }
             let node = &graph[idx];
             match node {
                 DagNode::Resource {
@@ -1949,6 +1983,22 @@ pub fn populate_object_from_cty(
         }
     }
     value
+}
+
+/// Collect a node and all its transitive dependencies (upstream ancestors) into a set.
+/// In the DAG, edges go from dependency → dependent, so we walk incoming edges.
+fn collect_dependencies(
+    graph: &petgraph::graph::DiGraph<DagNode, crate::dag::resource_graph::DependencyEdge>,
+    start: petgraph::graph::NodeIndex,
+    included: &mut std::collections::HashSet<petgraph::graph::NodeIndex>,
+) {
+    if !included.insert(start) {
+        return; // Already visited
+    }
+    // Walk incoming edges to find dependencies
+    for neighbor in graph.neighbors_directed(start, petgraph::Direction::Incoming) {
+        collect_dependencies(graph, neighbor, included);
+    }
 }
 
 /// Determine what action to take based on prior and planned state.
