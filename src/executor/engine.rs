@@ -237,7 +237,7 @@ impl ResourceEngine {
         let total_resources = graph
             .node_indices()
             .filter(|&idx| !matches!(graph[idx], DagNode::Output { .. }))
-            .filter(|idx| target_indices.as_ref().map_or(true, |t| t.contains(idx)))
+            .filter(|idx| target_indices.as_ref().is_none_or(|t| t.contains(idx)))
             .count();
         let mut planned_count = 0;
 

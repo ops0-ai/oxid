@@ -98,11 +98,7 @@ pub fn print_resource_plan(plan: &PlanSummary, _targets: &[String]) {
                 ResourceAction::Delete => ("-", |s: &str| s.red()),
                 _ => ("+", |s: &str| s.green()),
             };
-            let value_display = if output.value_known {
-                "(known after apply)".to_string()
-            } else {
-                "(known after apply)".to_string()
-            };
+            let value_display = "(known after apply)".to_string();
             let line = format!(
                 "  {} {:<width$} = {}",
                 icon,
