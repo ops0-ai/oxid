@@ -393,45 +393,151 @@ pub fn format_output_value(value: &serde_json::Value, indent: usize) -> String {
     }
 }
 
-/// Print the plan as machine-parseable JSON.
+/// Convert a ResourceAction to Terraform-compatible action strings.
+fn action_to_tf_actions(action: &ResourceAction) -> Vec<&'static str> {
+    match action {
+        ResourceAction::Create => vec!["create"],
+        ResourceAction::Update => vec!["update"],
+        ResourceAction::Delete => vec!["delete"],
+        ResourceAction::Replace => vec!["delete", "create"],
+        ResourceAction::Read => vec!["read"],
+        ResourceAction::NoOp => vec!["no-op"],
+    }
+}
+
+/// Build `after_unknown` — marks fields in planned_state that are unknown (null in planned
+/// but not explicitly set by user config).
+fn build_after_unknown(
+    planned: Option<&serde_json::Value>,
+    user_config: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(serde_json::Value::Object(planned_map)) = planned else {
+        return serde_json::json!({});
+    };
+    let user_map = user_config.and_then(|v| v.as_object());
+
+    let mut unknown = serde_json::Map::new();
+    for (key, value) in planned_map {
+        // If the planned value contains an "unknown" marker or is null but not in user config,
+        // mark it as unknown
+        let in_user_config = user_map.map(|m| m.contains_key(key)).unwrap_or(false);
+        if value.is_null() && !in_user_config {
+            unknown.insert(key.clone(), serde_json::Value::Bool(true));
+        } else if let serde_json::Value::Object(_) = value {
+            // Recurse for nested objects
+            let nested = build_after_unknown(Some(value), user_config.and_then(|u| u.get(key)));
+            if nested.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                unknown.insert(key.clone(), nested);
+            }
+        }
+    }
+    serde_json::Value::Object(unknown)
+}
+
+/// Parse address into (type, name) — e.g. "aws_vpc.main" → ("aws_vpc", "main")
+fn parse_address(address: &str) -> (&str, &str) {
+    // Handle data sources: "data.aws_ami.name" → type="aws_ami", name="name"
+    let addr = address.strip_prefix("data.").unwrap_or(address);
+    if let Some(dot) = addr.find('.') {
+        (&addr[..dot], &addr[dot + 1..])
+    } else {
+        (addr, "")
+    }
+}
+
+/// Print the plan as Terraform-compatible JSON (matches `terraform show -json tfplan`).
 pub fn print_plan_json(plan: &PlanSummary) {
-    let changes: Vec<serde_json::Value> = plan
+    let version = env!("CARGO_PKG_VERSION");
+
+    // Build resource_changes array (Terraform format)
+    let resource_changes: Vec<serde_json::Value> = plan
         .changes
         .iter()
+        .filter(|c| c.action != ResourceAction::Read || c.address.starts_with("data."))
         .map(|c| {
+            let (resource_type, name) = parse_address(&c.address);
+            let mode = if c.address.starts_with("data.") {
+                "data"
+            } else {
+                "managed"
+            };
+            let actions = action_to_tf_actions(&c.action);
+
             serde_json::json!({
                 "address": c.address,
-                "action": format!("{}", c.action),
-                "resource_type": c.resource_type,
-                "provider": c.provider_source,
-                "planned_state": c.planned_state,
-                "prior_state": c.prior_state,
-                "user_config": c.user_config,
-                "requires_replace": c.requires_replace,
+                "mode": mode,
+                "type": resource_type,
+                "name": name,
+                "provider_name": c.provider_source,
+                "change": {
+                    "actions": actions,
+                    "before": c.prior_state,
+                    "after": c.planned_state,
+                    "after_unknown": build_after_unknown(
+                        c.planned_state.as_ref(),
+                        c.user_config.as_ref(),
+                    ),
+                    "before_sensitive": {},
+                    "after_sensitive": {},
+                }
             })
         })
         .collect();
 
-    let outputs: Vec<serde_json::Value> = plan
-        .outputs
+    // Build planned_values.root_module.resources
+    let planned_resources: Vec<serde_json::Value> = plan
+        .changes
         .iter()
-        .map(|o| {
+        .filter(|c| {
+            matches!(
+                c.action,
+                ResourceAction::Create | ResourceAction::Update | ResourceAction::Replace
+            )
+        })
+        .map(|c| {
+            let (resource_type, name) = parse_address(&c.address);
             serde_json::json!({
-                "name": o.name,
-                "action": format!("{}", o.action),
-                "value_known": o.value_known,
+                "address": c.address,
+                "mode": "managed",
+                "type": resource_type,
+                "name": name,
+                "provider_name": c.provider_source,
+                "schema_version": 0,
+                "values": c.planned_state,
+                "sensitive_values": {},
             })
         })
         .collect();
+
+    // Build output_changes
+    let mut output_changes = serde_json::Map::new();
+    for output in &plan.outputs {
+        let actions = action_to_tf_actions(&output.action);
+        output_changes.insert(
+            output.name.clone(),
+            serde_json::json!({
+                "actions": actions,
+                "before": null,
+                "after_unknown": !output.value_known,
+                "after_sensitive": false,
+            }),
+        );
+    }
 
     let json = serde_json::json!({
-        "changes": changes,
-        "outputs": outputs,
+        "format_version": "1.2",
+        "oxid_version": version,
+        "planned_values": {
+            "root_module": {
+                "resources": planned_resources,
+            }
+        },
+        "resource_changes": resource_changes,
+        "output_changes": output_changes,
         "summary": {
             "add": plan.creates,
-            "change": plan.updates,
+            "change": plan.updates + plan.replaces,
             "destroy": plan.deletes,
-            "replace": plan.replaces,
         }
     });
 
