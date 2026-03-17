@@ -243,9 +243,21 @@ impl ResourceEngine {
 
         // Walk the graph to plan each resource
         for idx in graph.node_indices() {
-            // Skip nodes not in target set
+            // Skip nodes not in target set; for outputs, include only if all
+            // their dependencies (incoming edges) are in the target set.
             if let Some(ref targets) = target_indices {
-                if !targets.contains(&idx) {
+                if matches!(graph[idx], DagNode::Output { .. }) {
+                    let all_deps_included = graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .all(|dep| targets.contains(&dep));
+                    let has_deps = graph
+                        .neighbors_directed(idx, petgraph::Direction::Incoming)
+                        .next()
+                        .is_some();
+                    if !has_deps || !all_deps_included {
+                        continue;
+                    }
+                } else if !targets.contains(&idx) {
                     continue;
                 }
             }

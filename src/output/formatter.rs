@@ -14,71 +14,67 @@ pub fn print_error(msg: &str) {
 }
 
 /// Print a resource-level execution plan in a Terraform-like format.
-pub fn print_resource_plan(plan: &PlanSummary, targets: &[String]) {
+pub fn print_resource_plan(plan: &PlanSummary, _targets: &[String]) {
     println!();
 
-    if plan.changes.is_empty() {
+    if plan.changes.is_empty() && plan.outputs.is_empty() {
         println!("{}", "No changes. Infrastructure is up-to-date.".green());
         return;
     }
 
-    // Check if there are any actionable changes
+    // Check if there are any actionable changes (engine already filtered by target)
     let actionable: Vec<&PlannedChange> = plan
         .changes
         .iter()
         .filter(|c| c.action != ResourceAction::NoOp)
-        .filter(|c| targets.is_empty() || targets.iter().any(|t| c.address.contains(t)))
         .collect();
 
-    if actionable.is_empty() {
-        println!("{}", "No changes. Infrastructure is up-to-date.".green());
-        return;
-    }
+    if !actionable.is_empty() {
+        // Legend
+        println!("Oxid used the selected providers to generate the following execution plan.");
+        println!("Resource actions are indicated with the following symbols:");
 
-    // Legend
-    println!("Oxid used the selected providers to generate the following execution plan.");
-    println!("Resource actions are indicated with the following symbols:");
+        let has_creates = actionable
+            .iter()
+            .any(|c| c.action == ResourceAction::Create);
+        let has_updates = actionable
+            .iter()
+            .any(|c| c.action == ResourceAction::Update);
+        let has_deletes = actionable
+            .iter()
+            .any(|c| c.action == ResourceAction::Delete);
+        let has_replaces = actionable
+            .iter()
+            .any(|c| c.action == ResourceAction::Replace);
+        let has_reads = actionable.iter().any(|c| c.action == ResourceAction::Read);
 
-    let has_creates = actionable
-        .iter()
-        .any(|c| c.action == ResourceAction::Create);
-    let has_updates = actionable
-        .iter()
-        .any(|c| c.action == ResourceAction::Update);
-    let has_deletes = actionable
-        .iter()
-        .any(|c| c.action == ResourceAction::Delete);
-    let has_replaces = actionable
-        .iter()
-        .any(|c| c.action == ResourceAction::Replace);
-    let has_reads = actionable.iter().any(|c| c.action == ResourceAction::Read);
+        if has_creates {
+            println!("  {} create", "+".green().bold());
+        }
+        if has_updates {
+            println!("  {} update in-place", "~".yellow().bold());
+        }
+        if has_replaces {
+            println!(
+                "  {} destroy and then create replacement",
+                "-/+".magenta().bold()
+            );
+        }
+        if has_deletes {
+            println!("  {} destroy", "-".red().bold());
+        }
+        if has_reads {
+            println!(" {} read (data resources)", "<=".cyan().bold());
+        }
 
-    if has_creates {
-        println!("  {} create", "+".green().bold());
-    }
-    if has_updates {
-        println!("  {} update in-place", "~".yellow().bold());
-    }
-    if has_replaces {
-        println!(
-            "  {} destroy and then create replacement",
-            "-/+".magenta().bold()
-        );
-    }
-    if has_deletes {
-        println!("  {} destroy", "-".red().bold());
-    }
-    if has_reads {
-        println!(" {} read (data resources)", "<=".cyan().bold());
-    }
+        println!();
+        println!("Oxid will perform the following actions:");
+        println!();
 
-    println!();
-    println!("Oxid will perform the following actions:");
-    println!();
-
-    // Print each resource
-    for change in &actionable {
-        print_resource_change(change);
+        // Print each resource
+        for change in &actionable {
+            print_resource_change(change);
+        }
     }
 
     // Print summary
@@ -96,14 +92,25 @@ pub fn print_resource_plan(plan: &PlanSummary, targets: &[String]) {
             .unwrap_or(10);
 
         for output in &plan.outputs {
+            let (icon, color_fn): (&str, fn(&str) -> colored::ColoredString) = match output.action {
+                ResourceAction::Create => ("+", |s: &str| s.green()),
+                ResourceAction::Update => ("~", |s: &str| s.yellow()),
+                ResourceAction::Delete => ("-", |s: &str| s.red()),
+                _ => ("+", |s: &str| s.green()),
+            };
+            let value_display = if output.value_known {
+                "(known after apply)".to_string()
+            } else {
+                "(known after apply)".to_string()
+            };
             let line = format!(
                 "  {} {:<width$} = {}",
-                "+",
+                icon,
                 output.name,
-                "(known after apply)",
+                value_display,
                 width = name_width,
             );
-            println!("{}", line.green());
+            println!("{}", color_fn(&line));
         }
         println!();
     }
