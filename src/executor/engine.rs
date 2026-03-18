@@ -685,6 +685,17 @@ impl ResourceEngine {
                             )
                             .await?;
 
+                        // If prior state exists and planned state matches it, no changes needed.
+                        // Skip apply entirely and just populate the shared state map.
+                        if let Some(ref prior) = prior_state {
+                            if plan_result.planned_state.as_ref() == Some(prior)
+                                && plan_result.requires_replace.is_empty()
+                            {
+                                resource_states.insert(address.clone(), prior.clone());
+                                return Ok(Some(prior.clone()));
+                            }
+                        }
+
                         // If requires_replace is non-empty AND there's a prior state,
                         // we need to destroy the old resource first, then create new.
                         let apply_result =
@@ -1857,8 +1868,8 @@ fn resolve_interpolated_string(s: &str, ctx: &EvalContext) -> serde_json::Value 
     if s.starts_with("${") && s.ends_with('}') && s.matches("${").count() == 1 {
         let ref_str = &s[2..s.len() - 1];
 
-        // If it contains function call syntax or splats, parse as full HCL expression
-        if ref_str.contains('(') || ref_str.contains("[*]") {
+        // If it contains function calls, splats, or index expressions, parse as full HCL
+        if ref_str.contains('(') || ref_str.contains('[') {
             if let Some(result) = try_eval_hcl_expression(ref_str, ctx) {
                 return result;
             }
@@ -1887,8 +1898,8 @@ fn resolve_interpolated_string(s: &str, ctx: &EvalContext) -> serde_json::Value 
         if let Some(end) = find_matching_brace(&remaining[inner_start..]) {
             let ref_str = &remaining[inner_start..inner_start + end];
 
-            // Try HCL parsing for complex expressions
-            let resolved = if ref_str.contains('(') || ref_str.contains("[*]") {
+            // Try HCL parsing for complex expressions (function calls, index, splats)
+            let resolved = if ref_str.contains('(') || ref_str.contains('[') {
                 try_eval_hcl_expression(ref_str, ctx).unwrap_or_else(|| {
                     let ref_parts: Vec<String> =
                         ref_str.split('.').map(|p| p.trim().to_string()).collect();

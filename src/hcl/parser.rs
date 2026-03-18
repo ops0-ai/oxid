@@ -778,9 +778,14 @@ fn parse_nested_block_as_attribute(block: &hcl::Block) -> Expression {
                         entries.push((key, val));
                     }
                     Expression::Reference(ref parts) => {
-                        // Preserve as ${...} interpolation for the evaluator
-                        let ref_str = ref_parts_to_hcl(parts);
-                        entries.push((key, Value::String(format!("${{{}}}", ref_str))));
+                        // Preserve as ${...} interpolation for the evaluator.
+                        // Use ref_parts_to_hcl so index expressions like [count.index]
+                        // aren't separated by a dot (which breaks HCL re-parsing).
+                        // DAG extraction handles this via extract_refs_from_interpolation().
+                        entries.push((
+                            key,
+                            Value::String(format!("${{{}}}", ref_parts_to_hcl(parts))),
+                        ));
                     }
                     _ => {
                         // For other expressions (FunctionCall, Template, etc.),

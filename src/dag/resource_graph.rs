@@ -471,18 +471,9 @@ fn collect_references_from_value(val: &crate::config::types::Value, refs: &mut V
             while let Some(start) = remaining.find("${") {
                 if let Some(end) = remaining[start + 2..].find('}') {
                     let ref_str = &remaining[start + 2..start + 2 + end];
-                    let parts: Vec<&str> = ref_str.split('.').collect();
-                    if parts.len() >= 2 {
-                        match parts[0] {
-                            "var" | "local" | "each" | "count" | "path" | "terraform" | "self" => {}
-                            "data" if parts.len() >= 3 => {
-                                refs.push(format!("data.{}.{}", parts[1], parts[2]));
-                            }
-                            _ => {
-                                refs.push(format!("{}.{}", parts[0], parts[1]));
-                            }
-                        }
-                    }
+                    // Extract resource references from the interpolation.
+                    // Handle function calls by scanning for resource-like refs.
+                    extract_refs_from_interpolation(ref_str, refs);
                     remaining = &remaining[start + 2 + end + 1..];
                 } else {
                     break;
@@ -500,6 +491,58 @@ fn collect_references_from_value(val: &crate::config::types::Value, refs: &mut V
             }
         }
         _ => {}
+    }
+}
+
+/// Extract resource references from an interpolation string.
+/// Handles both simple refs like `aws_vpc.main.id` and function calls
+/// like `concat(aws_subnet.private[*].id, aws_subnet.public[*].id)`.
+fn extract_refs_from_interpolation(s: &str, refs: &mut Vec<String>) {
+    // Split on word boundaries to find resource-like references (type.name patterns).
+    // We look for sequences of word chars separated by dots that look like resource addresses.
+    let skip = [
+        "var",
+        "local",
+        "each",
+        "count",
+        "path",
+        "terraform",
+        "self",
+        "null",
+        "true",
+        "false",
+    ];
+
+    // Tokenize: split on anything that isn't a word char, dot, or bracket content
+    // Simple approach: split on commas, parens, spaces, then process each token
+    for token in s.split([',', '(', ')', ' ']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        // Strip leading/trailing brackets for splat-like tokens
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() >= 2 {
+            // Strip any [.*] from the resource name part
+            let type_name = parts[0].split('[').next().unwrap_or(parts[0]);
+            let name = parts[1].split('[').next().unwrap_or(parts[1]);
+            if type_name.is_empty() || name.is_empty() {
+                continue;
+            }
+            match type_name {
+                t if skip.contains(&t) => {}
+                "data" if parts.len() >= 3 => {
+                    let data_name = parts[2].split('[').next().unwrap_or(parts[2]);
+                    refs.push(format!("data.{}.{}", name, data_name));
+                }
+                _ => {
+                    // Looks like a resource reference
+                    if type_name.contains('_') || parts.len() >= 3 {
+                        refs.push(format!("{}.{}", type_name, name));
+                    }
+                }
+            }
+        }
     }
 }
 
