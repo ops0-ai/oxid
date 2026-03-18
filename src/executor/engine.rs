@@ -75,6 +75,9 @@ pub struct PlanSummary {
     /// Variable values for JSON plan output.
     #[serde(default)]
     pub variables: std::collections::HashMap<String, serde_json::Value>,
+    /// Terraform-compatible `configuration` section for JSON plan output.
+    #[serde(default)]
+    pub configuration: serde_json::Value,
 }
 
 impl std::fmt::Display for PlanSummary {
@@ -564,6 +567,8 @@ impl ResourceEngine {
             variables.insert(var.name.clone(), serde_json::json!({"value": value}));
         }
 
+        let configuration = build_plan_configuration(workspace);
+
         Ok(PlanSummary {
             changes,
             outputs,
@@ -573,6 +578,7 @@ impl ResourceEngine {
             replaces,
             no_ops,
             variables,
+            configuration,
         })
     }
 
@@ -1708,6 +1714,323 @@ pub fn build_variable_defaults(workspace: &WorkspaceConfig) -> HashMap<String, s
         }
     }
     defaults
+}
+
+/// Build the Terraform-compatible `configuration` section for JSON plan output.
+fn build_plan_configuration(workspace: &WorkspaceConfig) -> serde_json::Value {
+
+    // --- Provider configs ---
+    let mut provider_config = serde_json::Map::new();
+    for provider in &workspace.providers {
+        let full_name = if provider.source.contains('/')
+            && !provider.source.contains("registry.terraform.io")
+        {
+            format!("registry.terraform.io/{}", provider.source)
+        } else {
+            provider.source.clone()
+        };
+        let mut expressions = serde_json::Map::new();
+        for (key, expr) in &provider.config {
+            expressions.insert(key.clone(), expr_to_config_json(expr));
+        }
+        let key = if let Some(ref alias) = provider.alias {
+            format!("{}.{}", provider.name, alias)
+        } else {
+            provider.name.clone()
+        };
+        provider_config.insert(
+            key,
+            serde_json::json!({
+                "name": provider.name,
+                "full_name": full_name,
+                "expressions": expressions
+            }),
+        );
+    }
+
+    // --- Variables ---
+    let empty_ctx = EvalContext::plan_only(HashMap::new());
+    let mut variables = serde_json::Map::new();
+    for var in &workspace.variables {
+        let mut var_obj = serde_json::Map::new();
+        if let Some(ref desc) = var.description {
+            var_obj.insert("description".into(), serde_json::json!(desc));
+        }
+        if let Some(ref default) = var.default {
+            var_obj.insert("default".into(), eval_expression(default, &empty_ctx));
+        }
+        if var.sensitive {
+            var_obj.insert("sensitive".into(), serde_json::json!(true));
+        }
+        variables.insert(var.name.clone(), serde_json::Value::Object(var_obj));
+    }
+
+    // --- Resources ---
+    let mut resources = Vec::new();
+    for resource in &workspace.resources {
+        let provider_key = resource
+            .provider_ref
+            .as_deref()
+            .unwrap_or_else(|| resource.resource_type.split('_').next().unwrap_or("aws"));
+        let mut expressions = serde_json::Map::new();
+        for (key, expr) in &resource.attributes {
+            expressions.insert(key.clone(), expr_to_config_json(expr));
+        }
+        let mut entry = serde_json::json!({
+            "address": format!("{}.{}", resource.resource_type, resource.name),
+            "mode": "managed",
+            "type": resource.resource_type,
+            "name": resource.name,
+            "provider_config_key": provider_key,
+            "expressions": expressions,
+            "schema_version": 0
+        });
+        if let Some(ref count_expr) = resource.count {
+            entry["count_expression"] = expr_to_config_json(count_expr);
+        }
+        if let Some(ref each_expr) = resource.for_each {
+            entry["for_each_expression"] = expr_to_config_json(each_expr);
+        }
+        if !resource.depends_on.is_empty() {
+            entry["depends_on"] = serde_json::json!(resource.depends_on);
+        }
+        resources.push(entry);
+    }
+
+    // --- Data sources ---
+    for ds in &workspace.data_sources {
+        let provider_key = ds
+            .provider_ref
+            .as_deref()
+            .unwrap_or_else(|| ds.resource_type.split('_').next().unwrap_or("aws"));
+        let mut expressions = serde_json::Map::new();
+        for (key, expr) in &ds.attributes {
+            expressions.insert(key.clone(), expr_to_config_json(expr));
+        }
+        resources.push(serde_json::json!({
+            "address": format!("data.{}.{}", ds.resource_type, ds.name),
+            "mode": "data",
+            "type": ds.resource_type,
+            "name": ds.name,
+            "provider_config_key": provider_key,
+            "expressions": expressions,
+            "schema_version": 0
+        }));
+    }
+
+    serde_json::json!({
+        "provider_config": provider_config,
+        "root_module": {
+            "resources": resources,
+            "variables": variables
+        }
+    })
+}
+
+/// Convert a literal Value to Terraform config JSON, detecting `${var.xxx}` references.
+fn value_to_config_json(val: &crate::config::types::Value) -> serde_json::Value {
+    use crate::config::types::Value;
+    match val {
+        Value::String(s) => {
+            // Detect "${var.name}" or "${resource.name.attr}" patterns
+            let refs = extract_interpolation_refs(s);
+            if refs.is_empty() {
+                serde_json::json!({"constant_value": s})
+            } else {
+                serde_json::json!({"references": refs})
+            }
+        }
+        Value::Map(entries) => {
+            let mut block = serde_json::Map::new();
+            for (k, v) in entries {
+                block.insert(k.clone(), value_to_config_json(v));
+            }
+            serde_json::json!([serde_json::Value::Object(block)])
+        }
+        Value::List(items) if items.iter().all(|i| matches!(i, Value::Map(_))) => {
+            let blocks: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| {
+                    if let Value::Map(entries) = item {
+                        let mut block = serde_json::Map::new();
+                        for (k, v) in entries {
+                            block.insert(k.clone(), value_to_config_json(v));
+                        }
+                        serde_json::Value::Object(block)
+                    } else {
+                        serde_json::json!({})
+                    }
+                })
+                .collect();
+            serde_json::Value::Array(blocks)
+        }
+        Value::List(items) => {
+            // Check if any list items contain references
+            let mut all_refs = Vec::new();
+            for item in items {
+                if let Value::String(s) = item {
+                    all_refs.extend(extract_interpolation_refs(s));
+                }
+            }
+            if all_refs.is_empty() {
+                serde_json::json!({"constant_value": val.to_json()})
+            } else {
+                serde_json::json!({"references": all_refs})
+            }
+        }
+        _ => serde_json::json!({"constant_value": val.to_json()}),
+    }
+}
+
+/// Extract variable/resource references from `${...}` interpolation patterns in a string.
+fn extract_interpolation_refs(s: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let inner = after[..end].trim();
+            if !inner.is_empty() {
+                refs.push(inner.to_string());
+            }
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+    refs
+}
+
+/// Convert a config Expression to Terraform JSON config format.
+/// Literals → `{"constant_value": ...}`, References → `{"references": [...]}`.
+fn expr_to_config_json(expr: &crate::config::types::Expression) -> serde_json::Value {
+    use crate::config::types::{Expression, TemplatePart, Value};
+    match expr {
+        Expression::Literal(val) => match val {
+            // Nested blocks (maps) → array of expression objects
+            Value::Map(entries) => {
+                let mut block = serde_json::Map::new();
+                for (k, v) in entries {
+                    block.insert(k.clone(), value_to_config_json(v));
+                }
+                serde_json::json!([serde_json::Value::Object(block)])
+            }
+            // Lists of maps → array of block expression objects
+            Value::List(items)
+                if items.iter().all(|i| matches!(i, Value::Map(_))) =>
+            {
+                let blocks: Vec<serde_json::Value> = items
+                    .iter()
+                    .map(|item| {
+                        if let Value::Map(entries) = item {
+                            let mut block = serde_json::Map::new();
+                            for (k, v) in entries {
+                                block.insert(k.clone(), value_to_config_json(v));
+                            }
+                            serde_json::Value::Object(block)
+                        } else {
+                            serde_json::json!({})
+                        }
+                    })
+                    .collect();
+                serde_json::Value::Array(blocks)
+            }
+            _ => value_to_config_json(val),
+        },
+        Expression::Reference(parts) => {
+            serde_json::json!({"references": [parts.join(".")]})
+        }
+        Expression::Template(parts) => {
+            let mut refs = Vec::new();
+            for part in parts {
+                if let TemplatePart::Interpolation(inner) = part {
+                    collect_expr_refs(inner, &mut refs);
+                }
+            }
+            if refs.is_empty() {
+                let s: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        TemplatePart::Literal(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                serde_json::json!({"constant_value": s})
+            } else {
+                serde_json::json!({"references": refs})
+            }
+        }
+        _ => {
+            // For complex expressions, extract any references
+            let mut refs = Vec::new();
+            collect_expr_refs(expr, &mut refs);
+            if refs.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"references": refs})
+            }
+        }
+    }
+}
+
+/// Recursively collect variable/resource references from an expression.
+fn collect_expr_refs(expr: &crate::config::types::Expression, refs: &mut Vec<String>) {
+    use crate::config::types::{Expression, TemplatePart};
+    match expr {
+        Expression::Reference(parts) => refs.push(parts.join(".")),
+        Expression::Template(parts) => {
+            for part in parts {
+                if let TemplatePart::Interpolation(inner) = part {
+                    collect_expr_refs(inner, refs);
+                }
+            }
+        }
+        Expression::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_expr_refs(arg, refs);
+            }
+        }
+        Expression::GetAttr { object, .. } => collect_expr_refs(object, refs),
+        Expression::Index { collection, key } => {
+            collect_expr_refs(collection, refs);
+            collect_expr_refs(key, refs);
+        }
+        Expression::Conditional {
+            condition,
+            true_val,
+            false_val,
+        } => {
+            collect_expr_refs(condition, refs);
+            collect_expr_refs(true_val, refs);
+            collect_expr_refs(false_val, refs);
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            collect_expr_refs(left, refs);
+            collect_expr_refs(right, refs);
+        }
+        Expression::UnaryOp { operand, .. } => collect_expr_refs(operand, refs),
+        Expression::Splat { source, each } => {
+            collect_expr_refs(source, refs);
+            collect_expr_refs(each, refs);
+        }
+        Expression::ForExpr {
+            collection,
+            value_expr,
+            key_expr,
+            condition,
+            ..
+        } => {
+            collect_expr_refs(collection, refs);
+            collect_expr_refs(value_expr, refs);
+            if let Some(key) = key_expr {
+                collect_expr_refs(key, refs);
+            }
+            if let Some(cond) = condition {
+                collect_expr_refs(cond, refs);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Resolve attribute expressions to JSON, substituting variable references.

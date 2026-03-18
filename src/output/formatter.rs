@@ -438,11 +438,19 @@ fn build_after_unknown(
 }
 
 /// Parse address into (type, name) — e.g. "aws_vpc.main" → ("aws_vpc", "main")
+/// Strips index suffix [0] or ["key"] from name for Terraform JSON compatibility.
 fn parse_address(address: &str) -> (&str, &str) {
     // Handle data sources: "data.aws_ami.name" → type="aws_ami", name="name"
     let addr = address.strip_prefix("data.").unwrap_or(address);
     if let Some(dot) = addr.find('.') {
-        (&addr[..dot], &addr[dot + 1..])
+        let name = &addr[dot + 1..];
+        // Strip index suffix: "nat[0]" → "nat", "bucket[\"key\"]" → "bucket"
+        let clean_name = if let Some(bracket) = name.find('[') {
+            &name[..bracket]
+        } else {
+            name
+        };
+        (&addr[..dot], clean_name)
     } else {
         (addr, "")
     }
@@ -575,7 +583,7 @@ pub fn print_plan_json(plan: &PlanSummary) {
         );
     }
 
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "format_version": "1.2",
         "terraform_version": format!("oxid-{}", version),
         "applyable": plan.creates > 0 || plan.updates > 0 || plan.deletes > 0 || plan.replaces > 0,
@@ -591,6 +599,11 @@ pub fn print_plan_json(plan: &PlanSummary) {
         "resource_changes": resource_changes,
         "output_changes": output_changes,
     });
+
+    // Include configuration section if available (matches Terraform's `configuration` block)
+    if !plan.configuration.is_null() {
+        json["configuration"] = plan.configuration.clone();
+    }
 
     println!(
         "{}",
