@@ -676,7 +676,7 @@ fn expr_to_hcl_repr(expr: &Expression) -> String {
         Expression::FunctionCall { name, args } => {
             let args_str = args
                 .iter()
-                .map(|a| expr_to_hcl_repr(a))
+                .map(expr_to_hcl_repr)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{}({})", name, args_str)
@@ -752,7 +752,11 @@ fn expr_to_hcl_repr(expr: &Expression) -> String {
             )
         }
         Expression::Index { collection, key } => {
-            format!("{}[{}]", expr_to_hcl_repr(collection), expr_to_hcl_repr(key))
+            format!(
+                "{}[{}]",
+                expr_to_hcl_repr(collection),
+                expr_to_hcl_repr(key)
+            )
         }
         Expression::GetAttr { object, name } => {
             format!("{}.{}", expr_to_hcl_repr(object), name)

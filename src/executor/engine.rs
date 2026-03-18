@@ -1505,10 +1505,8 @@ pub fn eval_expression(
                 }
                 "cidrhost" => {
                     // cidrhost(prefix, hostnum)
-                    if let (
-                        Some(serde_json::Value::String(prefix)),
-                        Some(hostnum_val),
-                    ) = (evaluated_args.first(), evaluated_args.get(1))
+                    if let (Some(serde_json::Value::String(prefix)), Some(hostnum_val)) =
+                        (evaluated_args.first(), evaluated_args.get(1))
                     {
                         let hostnum = hostnum_val.as_u64().unwrap_or(0) as u32;
                         cidrhost_impl(prefix, hostnum)
@@ -1571,7 +1569,9 @@ pub fn eval_expression(
                 // map[number_key] — convert number to string key
                 (serde_json::Value::Object(obj), serde_json::Value::Number(n)) => {
                     let key_str = n.to_string();
-                    obj.get(&key_str).cloned().unwrap_or(serde_json::Value::Null)
+                    obj.get(&key_str)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
                 }
                 _ => serde_json::Value::Null,
             }
@@ -1734,7 +1734,10 @@ fn traverse_ref_parts(
                     current = arr.get(idx).cloned().unwrap_or(serde_json::Value::Null);
                 }
                 (serde_json::Value::Object(obj), serde_json::Value::String(s)) => {
-                    current = obj.get(s.as_str()).cloned().unwrap_or(serde_json::Value::Null);
+                    current = obj
+                        .get(s.as_str())
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                 }
                 _ => return serde_json::Value::Null,
             }
@@ -1742,7 +1745,10 @@ fn traverse_ref_parts(
             // Attribute access
             match &current {
                 serde_json::Value::Object(obj) => {
-                    current = obj.get(part.as_str()).cloned().unwrap_or(serde_json::Value::Null);
+                    current = obj
+                        .get(part.as_str())
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                 }
                 _ => return serde_json::Value::Null,
             }
