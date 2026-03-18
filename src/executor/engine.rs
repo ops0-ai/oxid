@@ -1718,7 +1718,6 @@ pub fn build_variable_defaults(workspace: &WorkspaceConfig) -> HashMap<String, s
 
 /// Build the Terraform-compatible `configuration` section for JSON plan output.
 fn build_plan_configuration(workspace: &WorkspaceConfig) -> serde_json::Value {
-
     // --- Provider configs ---
     let mut provider_config = serde_json::Map::new();
     for provider in &workspace.providers {
@@ -1916,9 +1915,7 @@ fn expr_to_config_json(expr: &crate::config::types::Expression) -> serde_json::V
                 serde_json::json!([serde_json::Value::Object(block)])
             }
             // Lists of maps → array of block expression objects
-            Value::List(items)
-                if items.iter().all(|i| matches!(i, Value::Map(_))) =>
-            {
+            Value::List(items) if items.iter().all(|i| matches!(i, Value::Map(_))) => {
                 let blocks: Vec<serde_json::Value> = items
                     .iter()
                     .map(|item| {
