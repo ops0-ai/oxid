@@ -49,6 +49,9 @@ pub struct PlannedChange {
     pub user_config: Option<serde_json::Value>,
     pub requires_replace: Vec<String>,
     pub planned_private: Vec<u8>,
+    /// Count index (0, 1, ...) or for_each key for indexed resources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<serde_json::Value>,
 }
 
 /// A planned output change.
@@ -69,6 +72,9 @@ pub struct PlanSummary {
     pub deletes: usize,
     pub replaces: usize,
     pub no_ops: usize,
+    /// Variable values for JSON plan output.
+    #[serde(default)]
+    pub variables: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl std::fmt::Display for PlanSummary {
@@ -395,6 +401,7 @@ impl ResourceEngine {
                         user_config: Some(user_config),
                         requires_replace: plan_result.requires_replace,
                         planned_private: plan_result.planned_private,
+                        index: resource_index_to_json(index.as_ref()),
                     });
                 }
                 DagNode::DataSource {
@@ -428,6 +435,7 @@ impl ResourceEngine {
                                 user_config: None,
                                 requires_replace: vec![],
                                 planned_private: vec![],
+                                index: resource_index_to_json(index.as_ref()),
                             });
                         } else {
                             println!(
@@ -511,6 +519,7 @@ impl ResourceEngine {
                         user_config: Some(user_config),
                         requires_replace: vec![],
                         planned_private: vec![],
+                        index: resource_index_to_json(index.as_ref()),
                     });
                 }
                 DagNode::Output { ref name, .. } => {
@@ -544,6 +553,17 @@ impl ResourceEngine {
             .filter(|c| c.action == ResourceAction::NoOp)
             .count();
 
+        // Build variables map from workspace config (resolved defaults)
+        let plan_var_defaults = build_variable_defaults(workspace);
+        let mut variables = std::collections::HashMap::new();
+        for var in &workspace.variables {
+            let value = plan_var_defaults
+                .get(&var.name)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            variables.insert(var.name.clone(), serde_json::json!({"value": value}));
+        }
+
         Ok(PlanSummary {
             changes,
             outputs,
@@ -552,6 +572,7 @@ impl ResourceEngine {
             deletes,
             replaces,
             no_ops,
+            variables,
         })
     }
 
@@ -2010,6 +2031,21 @@ fn collect_dependencies(
     // Walk incoming edges to find dependencies
     for neighbor in graph.neighbors_directed(start, petgraph::Direction::Incoming) {
         collect_dependencies(graph, neighbor, included);
+    }
+}
+
+/// Convert a ResourceIndex to a JSON value for the plan output.
+fn resource_index_to_json(
+    index: Option<&crate::config::types::ResourceIndex>,
+) -> Option<serde_json::Value> {
+    match index {
+        Some(crate::config::types::ResourceIndex::Count(i)) => {
+            Some(serde_json::Value::Number((*i).into()))
+        }
+        Some(crate::config::types::ResourceIndex::ForEach(k)) => {
+            Some(serde_json::Value::String(k.clone()))
+        }
+        None => None,
     }
 }
 

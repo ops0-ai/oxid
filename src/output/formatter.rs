@@ -477,7 +477,18 @@ pub fn print_plan_json(plan: &PlanSummary) {
             let actions = action_to_tf_actions(&c.action);
             let provider_name = normalize_provider_name(&c.provider_source);
 
-            serde_json::json!({
+            let before_sensitive = if c.prior_state.is_none() {
+                serde_json::json!(false)
+            } else {
+                build_sensitive_values(c.prior_state.as_ref())
+            };
+            let after_sensitive = if c.planned_state.is_none() {
+                serde_json::json!(false)
+            } else {
+                build_sensitive_values(c.planned_state.as_ref())
+            };
+
+            let mut entry = serde_json::json!({
                 "address": c.address,
                 "mode": mode,
                 "type": resource_type,
@@ -491,10 +502,14 @@ pub fn print_plan_json(plan: &PlanSummary) {
                         c.planned_state.as_ref(),
                         c.user_config.as_ref(),
                     ),
-                    "before_sensitive": serde_json::json!({}),
-                    "after_sensitive": serde_json::json!({}),
+                    "before_sensitive": before_sensitive,
+                    "after_sensitive": after_sensitive,
                 }
-            })
+            });
+            if let Some(ref idx) = c.index {
+                entry["index"] = idx.clone();
+            }
+            entry
         })
         .collect();
 
@@ -503,18 +518,19 @@ pub fn print_plan_json(plan: &PlanSummary) {
         .changes
         .iter()
         .filter(|c| {
-            matches!(
-                c.action,
-                ResourceAction::Create
-                    | ResourceAction::Update
-                    | ResourceAction::Replace
-                    | ResourceAction::NoOp
-            )
+            !c.address.starts_with("data.")
+                && matches!(
+                    c.action,
+                    ResourceAction::Create
+                        | ResourceAction::Update
+                        | ResourceAction::Replace
+                        | ResourceAction::NoOp
+                )
         })
         .map(|c| {
             let (resource_type, name) = parse_address(&c.address);
             let provider_name = normalize_provider_name(&c.provider_source);
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "address": c.address,
                 "mode": "managed",
                 "type": resource_type,
@@ -522,19 +538,22 @@ pub fn print_plan_json(plan: &PlanSummary) {
                 "provider_name": provider_name,
                 "schema_version": 0,
                 "values": c.planned_state,
-                "sensitive_values": serde_json::json!({}),
-            })
+                "sensitive_values": build_sensitive_values(c.planned_state.as_ref()),
+            });
+            if let Some(ref idx) = c.index {
+                entry["index"] = idx.clone();
+            }
+            entry
         })
         .collect();
 
-    // Build planned_values.outputs
+    // Build planned_values.outputs (Terraform: just {"sensitive": false} per output)
     let mut planned_outputs = serde_json::Map::new();
     for output in &plan.outputs {
         planned_outputs.insert(
             output.name.clone(),
             serde_json::json!({
                 "sensitive": false,
-                "value": null,
             }),
         );
     }
@@ -556,16 +575,13 @@ pub fn print_plan_json(plan: &PlanSummary) {
         );
     }
 
-    // Build variables map
-    let variables = serde_json::json!({});
-
     let json = serde_json::json!({
         "format_version": "1.2",
         "terraform_version": format!("oxid-{}", version),
         "applyable": plan.creates > 0 || plan.updates > 0 || plan.deletes > 0 || plan.replaces > 0,
         "complete": true,
         "errored": false,
-        "variables": variables,
+        "variables": plan.variables,
         "planned_values": {
             "outputs": planned_outputs,
             "root_module": {
@@ -580,6 +596,36 @@ pub fn print_plan_json(plan: &PlanSummary) {
         "{}",
         serde_json::to_string_pretty(&json).unwrap_or_default()
     );
+}
+
+/// Build sensitive_values structure matching Terraform format.
+/// Objects get `{}` for each nested object, arrays get `[]` or `[false, ...]` etc.
+fn build_sensitive_values(state: Option<&serde_json::Value>) -> serde_json::Value {
+    match state {
+        Some(serde_json::Value::Object(obj)) => {
+            let mut result = serde_json::Map::new();
+            for (key, value) in obj {
+                match value {
+                    serde_json::Value::Object(_) => {
+                        result.insert(key.clone(), build_sensitive_values(Some(value)));
+                    }
+                    serde_json::Value::Array(arr) => {
+                        let inner: Vec<serde_json::Value> = arr
+                            .iter()
+                            .map(|v| match v {
+                                serde_json::Value::Object(_) => build_sensitive_values(Some(v)),
+                                _ => serde_json::json!(false),
+                            })
+                            .collect();
+                        result.insert(key.clone(), serde_json::Value::Array(inner));
+                    }
+                    _ => {} // scalar values not included in sensitive_values
+                }
+            }
+            serde_json::Value::Object(result)
+        }
+        _ => serde_json::json!({}),
+    }
 }
 
 /// Print a list of resources from state.
