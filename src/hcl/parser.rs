@@ -655,6 +655,112 @@ pub fn hcl_expr_to_expression(expr: &hcl::Expression) -> Expression {
     }
 }
 
+/// Convert Reference parts back to valid HCL traversal syntax.
+/// Handles `[*]` and `[expr]` parts correctly (no dot before brackets).
+fn ref_parts_to_hcl(parts: &[String]) -> String {
+    let mut result = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 && !part.starts_with('[') {
+            result.push('.');
+        }
+        result.push_str(part);
+    }
+    result
+}
+
+/// Convert an Expression back to valid HCL syntax for embedding in `${...}` strings.
+/// This is the inverse of `hcl_expr_to_expression` for nested block values.
+fn expr_to_hcl_repr(expr: &Expression) -> String {
+    match expr {
+        Expression::Reference(parts) => ref_parts_to_hcl(parts),
+        Expression::FunctionCall { name, args } => {
+            let args_str = args
+                .iter()
+                .map(|a| expr_to_hcl_repr(a))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({})", name, args_str)
+        }
+        Expression::Literal(Value::String(s)) => format!("\"{}\"", s),
+        Expression::Literal(Value::Int(i)) => i.to_string(),
+        Expression::Literal(Value::Float(f)) => f.to_string(),
+        Expression::Literal(Value::Bool(b)) => b.to_string(),
+        Expression::Literal(Value::Null) => "null".to_string(),
+        Expression::Literal(Value::List(items)) => {
+            let items_str = items
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => format!("\"{}\"", s),
+                    Value::Int(i) => i.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::Null => "null".to_string(),
+                    _ => format!("{:?}", v),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{}]", items_str)
+        }
+        Expression::Template(parts) => {
+            let mut result = String::new();
+            for part in parts {
+                match part {
+                    crate::config::types::TemplatePart::Literal(s) => result.push_str(s),
+                    crate::config::types::TemplatePart::Interpolation(e) => {
+                        result.push_str(&format!("${{{}}}", expr_to_hcl_repr(e)));
+                    }
+                    crate::config::types::TemplatePart::Directive(e) => {
+                        result.push_str(&format!("%{{{}}}", expr_to_hcl_repr(e)));
+                    }
+                }
+            }
+            format!("\"{}\"", result)
+        }
+        Expression::BinaryOp { op, left, right } => {
+            let op_str = match op {
+                crate::config::types::BinOp::Add => "+",
+                crate::config::types::BinOp::Sub => "-",
+                crate::config::types::BinOp::Mul => "*",
+                crate::config::types::BinOp::Div => "/",
+                crate::config::types::BinOp::Mod => "%",
+                crate::config::types::BinOp::Eq => "==",
+                crate::config::types::BinOp::NotEq => "!=",
+                crate::config::types::BinOp::Lt => "<",
+                crate::config::types::BinOp::Lte => "<=",
+                crate::config::types::BinOp::Gt => ">",
+                crate::config::types::BinOp::Gte => ">=",
+                crate::config::types::BinOp::And => "&&",
+                crate::config::types::BinOp::Or => "||",
+            };
+            format!(
+                "{} {} {}",
+                expr_to_hcl_repr(left),
+                op_str,
+                expr_to_hcl_repr(right)
+            )
+        }
+        Expression::Conditional {
+            condition,
+            true_val,
+            false_val,
+        } => {
+            format!(
+                "{} ? {} : {}",
+                expr_to_hcl_repr(condition),
+                expr_to_hcl_repr(true_val),
+                expr_to_hcl_repr(false_val)
+            )
+        }
+        Expression::Index { collection, key } => {
+            format!("{}[{}]", expr_to_hcl_repr(collection), expr_to_hcl_repr(key))
+        }
+        Expression::GetAttr { object, name } => {
+            format!("{}.{}", expr_to_hcl_repr(object), name)
+        }
+        _ => format!("{:?}", expr), // fallback for truly unsupported types
+    }
+}
+
 fn parse_nested_block_as_attribute(block: &hcl::Block) -> Expression {
     let mut entries = Vec::new();
 
@@ -669,16 +775,15 @@ fn parse_nested_block_as_attribute(block: &hcl::Block) -> Expression {
                     }
                     Expression::Reference(ref parts) => {
                         // Preserve as ${...} interpolation for the evaluator
-                        entries.push((key, Value::String(format!("${{{}}}", parts.join(".")))));
-                    }
-                    Expression::Template(_) => {
-                        // Template expressions — evaluate to string via eval
-                        entries.push((key, Value::String(format!("{:?}", value))));
+                        let ref_str = ref_parts_to_hcl(parts);
+                        entries.push((key, Value::String(format!("${{{}}}", ref_str))));
                     }
                     _ => {
-                        // For other expressions (FunctionCall etc.), wrap as ${...}
-                        // so the evaluator has a chance to process them
-                        entries.push((key, Value::String(format!("{:?}", value))));
+                        // For other expressions (FunctionCall, Template, etc.),
+                        // serialize to valid HCL syntax wrapped in ${...}
+                        // so the evaluator can re-parse and evaluate them.
+                        let hcl_str = expr_to_hcl_repr(&value);
+                        entries.push((key, Value::String(format!("${{{}}}", hcl_str))));
                     }
                 }
             }
@@ -721,6 +826,7 @@ fn expr_to_string(expr: &hcl::Expression) -> String {
             }
             parts.join(".")
         }
+        hcl::Expression::TemplateExpr(template) => template.to_string(),
         _ => format!("{:?}", expr),
     }
 }

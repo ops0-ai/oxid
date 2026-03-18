@@ -1484,6 +1484,54 @@ pub fn eval_expression(
                         serde_json::Value::Array(vec![])
                     }
                 }
+                // ── Network / CIDR functions ──────────────────────────
+                "cidrsubnet" => {
+                    // cidrsubnet(prefix, newbits, netnum)
+                    if let (
+                        Some(serde_json::Value::String(prefix)),
+                        Some(newbits_val),
+                        Some(netnum_val),
+                    ) = (
+                        evaluated_args.first(),
+                        evaluated_args.get(1),
+                        evaluated_args.get(2),
+                    ) {
+                        let newbits = newbits_val.as_u64().unwrap_or(0) as u32;
+                        let netnum = netnum_val.as_u64().unwrap_or(0) as u32;
+                        cidrsubnet_impl(prefix, newbits, netnum)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                "cidrhost" => {
+                    // cidrhost(prefix, hostnum)
+                    if let (
+                        Some(serde_json::Value::String(prefix)),
+                        Some(hostnum_val),
+                    ) = (evaluated_args.first(), evaluated_args.get(1))
+                    {
+                        let hostnum = hostnum_val.as_u64().unwrap_or(0) as u32;
+                        cidrhost_impl(prefix, hostnum)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                "cidrnetmask" => {
+                    // cidrnetmask(prefix)
+                    if let Some(serde_json::Value::String(prefix)) = evaluated_args.first() {
+                        if let Some((_ip, mask_str)) = prefix.split_once('/') {
+                            let mask: u32 = mask_str.parse().unwrap_or(0);
+                            let mask_bits = if mask == 0 { 0 } else { !0u32 << (32 - mask) };
+                            serde_json::Value::String(
+                                std::net::Ipv4Addr::from(mask_bits).to_string(),
+                            )
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
                 other => {
                     tracing::warn!("Unsupported function: {}()", other);
                     serde_json::Value::Null
@@ -1507,6 +1555,64 @@ pub fn eval_expression(
                 eval_expression(false_val, ctx)
             }
         }
+        Expression::Index { collection, key } => {
+            let coll = eval_expression(collection, ctx);
+            let k = eval_expression(key, ctx);
+            match (&coll, &k) {
+                // array[int]
+                (serde_json::Value::Array(arr), serde_json::Value::Number(n)) => {
+                    let idx = n.as_u64().unwrap_or(0) as usize;
+                    arr.get(idx).cloned().unwrap_or(serde_json::Value::Null)
+                }
+                // map["key"]
+                (serde_json::Value::Object(obj), serde_json::Value::String(s)) => {
+                    obj.get(s).cloned().unwrap_or(serde_json::Value::Null)
+                }
+                // map[number_key] — convert number to string key
+                (serde_json::Value::Object(obj), serde_json::Value::Number(n)) => {
+                    let key_str = n.to_string();
+                    obj.get(&key_str).cloned().unwrap_or(serde_json::Value::Null)
+                }
+                _ => serde_json::Value::Null,
+            }
+        }
+        Expression::GetAttr { object, name } => {
+            let obj = eval_expression(object, ctx);
+            match obj {
+                serde_json::Value::Object(map) => {
+                    map.get(name).cloned().unwrap_or(serde_json::Value::Null)
+                }
+                _ => serde_json::Value::Null,
+            }
+        }
+        Expression::BinaryOp { op, left, right } => {
+            let l = eval_expression(left, ctx);
+            let r = eval_expression(right, ctx);
+            use crate::config::types::BinOp;
+            match op {
+                BinOp::Add => {
+                    let lf = l.as_f64().unwrap_or(0.0);
+                    let rf = r.as_f64().unwrap_or(0.0);
+                    let sum = lf + rf;
+                    if sum.fract() == 0.0 {
+                        serde_json::json!(sum as i64)
+                    } else {
+                        serde_json::json!(sum)
+                    }
+                }
+                BinOp::Sub => {
+                    let lf = l.as_f64().unwrap_or(0.0);
+                    let rf = r.as_f64().unwrap_or(0.0);
+                    let diff = lf - rf;
+                    if diff.fract() == 0.0 {
+                        serde_json::json!(diff as i64)
+                    } else {
+                        serde_json::json!(diff)
+                    }
+                }
+                _ => serde_json::Value::Null,
+            }
+        }
         _ => serde_json::Value::Null,
     }
 }
@@ -1515,6 +1621,9 @@ pub fn eval_expression(
 fn resolve_reference(parts: &[String], ctx: &EvalContext) -> serde_json::Value {
     if parts.len() >= 2 && parts[0] == "var" {
         if let Some(val) = ctx.var_defaults.get(&parts[1]) {
+            if parts.len() > 2 {
+                return traverse_ref_parts(val, &parts[2..], ctx);
+            }
             return val.clone();
         }
         return serde_json::Value::Null;
@@ -1606,6 +1715,66 @@ fn resolve_reference(parts: &[String], ctx: &EvalContext) -> serde_json::Value {
 
 /// Traverse a JSON value by attribute path.
 /// e.g. ["id"] looks up state["id"], ["tags", "Name"] looks up state["tags"]["Name"]
+/// Traverse remaining reference parts that may include `[expr]` index access.
+/// Handles patterns like `var.list[count.index]` where parts = `["[count.index]"]`.
+fn traverse_ref_parts(
+    value: &serde_json::Value,
+    parts: &[String],
+    ctx: &EvalContext,
+) -> serde_json::Value {
+    let mut current = value.clone();
+    for part in parts {
+        if part.starts_with('[') && part.ends_with(']') {
+            // Index access: [expr]
+            let inner = &part[1..part.len() - 1];
+            let index = resolve_index_expr(inner, ctx);
+            match (&current, &index) {
+                (serde_json::Value::Array(arr), serde_json::Value::Number(n)) => {
+                    let idx = n.as_u64().unwrap_or(0) as usize;
+                    current = arr.get(idx).cloned().unwrap_or(serde_json::Value::Null);
+                }
+                (serde_json::Value::Object(obj), serde_json::Value::String(s)) => {
+                    current = obj.get(s.as_str()).cloned().unwrap_or(serde_json::Value::Null);
+                }
+                _ => return serde_json::Value::Null,
+            }
+        } else {
+            // Attribute access
+            match &current {
+                serde_json::Value::Object(obj) => {
+                    current = obj.get(part.as_str()).cloned().unwrap_or(serde_json::Value::Null);
+                }
+                _ => return serde_json::Value::Null,
+            }
+        }
+    }
+    current
+}
+
+/// Resolve a bracketed index expression like `count.index`, `each.key`, `0`, or a var ref.
+fn resolve_index_expr(expr: &str, ctx: &EvalContext) -> serde_json::Value {
+    if expr == "count.index" {
+        return ctx
+            .count_index
+            .map(|i| serde_json::json!(i))
+            .unwrap_or(serde_json::Value::Null);
+    }
+    if expr == "each.key" {
+        return ctx
+            .each_key
+            .as_ref()
+            .map(|k| serde_json::Value::String(k.clone()))
+            .unwrap_or(serde_json::Value::Null);
+    }
+    // Literal number
+    if let Ok(n) = expr.parse::<u64>() {
+        return serde_json::json!(n);
+    }
+    // General reference (e.g., var.something)
+    let ref_parts: Vec<String> = expr.split('.').map(|s| s.to_string()).collect();
+    resolve_reference(&ref_parts, ctx)
+}
+
 fn traverse_json_value(value: &serde_json::Value, path: &[String]) -> serde_json::Value {
     let mut current = value;
     for key in path {
@@ -1655,7 +1824,18 @@ fn resolve_value_json(val: &crate::config::types::Value, ctx: &EvalContext) -> s
         Value::Map(entries) => {
             let map: serde_json::Map<String, serde_json::Value> = entries
                 .iter()
-                .map(|(k, v)| (k.clone(), resolve_value_json(v, ctx)))
+                .map(|(k, v)| {
+                    // Resolve ${...} in map keys (e.g. "kubernetes.io/cluster/${var.cluster_name}")
+                    let resolved_key = if k.contains("${") {
+                        match resolve_interpolated_string(k, ctx) {
+                            serde_json::Value::String(s) => s,
+                            _ => k.clone(),
+                        }
+                    } else {
+                        k.clone()
+                    };
+                    (resolved_key, resolve_value_json(v, ctx))
+                })
                 .collect();
             serde_json::Value::Object(map)
         }
@@ -1663,16 +1843,30 @@ fn resolve_value_json(val: &crate::config::types::Value, ctx: &EvalContext) -> s
 }
 
 /// Resolve `${...}` interpolations in a string value.
-/// Handles both variable refs (${var.xxx}) and resource refs (${aws_s3_bucket.xxx.id}).
+/// Handles variable refs (${var.xxx}), resource refs (${aws_s3_bucket.xxx.id}),
+/// and complex expressions like function calls (${concat(a, b)}).
 fn resolve_interpolated_string(s: &str, ctx: &EvalContext) -> serde_json::Value {
     // If the string is a single interpolation like "${aws_s3_bucket.xxx.id}",
     // return the raw value (could be non-string)
     if s.starts_with("${") && s.ends_with('}') && s.matches("${").count() == 1 {
         let ref_str = &s[2..s.len() - 1];
+
+        // If it contains function call syntax or splats, parse as full HCL expression
+        if ref_str.contains('(') || ref_str.contains("[*]") {
+            if let Some(result) = try_eval_hcl_expression(ref_str, ctx) {
+                return result;
+            }
+        }
+
         let ref_parts: Vec<String> = ref_str.split('.').map(|p| p.trim().to_string()).collect();
         let resolved = resolve_reference(&ref_parts, ctx);
         if !resolved.is_null() {
             return resolved;
+        }
+
+        // Fallback: try HCL parsing for any unresolved single interpolation
+        if let Some(result) = try_eval_hcl_expression(ref_str, ctx) {
+            return result;
         }
     }
 
@@ -1682,10 +1876,23 @@ fn resolve_interpolated_string(s: &str, ctx: &EvalContext) -> serde_json::Value 
     while let Some(start) = remaining.find("${") {
         result.push_str(&remaining[..start]);
 
-        if let Some(end) = remaining[start + 2..].find('}') {
-            let ref_str = &remaining[start + 2..start + 2 + end];
-            let ref_parts: Vec<String> = ref_str.split('.').map(|p| p.trim().to_string()).collect();
-            let resolved = resolve_reference(&ref_parts, ctx);
+        // Find matching closing brace (handling nested parens/brackets)
+        let inner_start = start + 2;
+        if let Some(end) = find_matching_brace(&remaining[inner_start..]) {
+            let ref_str = &remaining[inner_start..inner_start + end];
+
+            // Try HCL parsing for complex expressions
+            let resolved = if ref_str.contains('(') || ref_str.contains("[*]") {
+                try_eval_hcl_expression(ref_str, ctx).unwrap_or_else(|| {
+                    let ref_parts: Vec<String> =
+                        ref_str.split('.').map(|p| p.trim().to_string()).collect();
+                    resolve_reference(&ref_parts, ctx)
+                })
+            } else {
+                let ref_parts: Vec<String> =
+                    ref_str.split('.').map(|p| p.trim().to_string()).collect();
+                resolve_reference(&ref_parts, ctx)
+            };
             match resolved {
                 serde_json::Value::String(s) => result.push_str(&s),
                 serde_json::Value::Number(n) => result.push_str(&n.to_string()),
@@ -1693,7 +1900,7 @@ fn resolve_interpolated_string(s: &str, ctx: &EvalContext) -> serde_json::Value 
                 serde_json::Value::Null => {} // unresolved ref — skip
                 _ => result.push_str(&resolved.to_string()),
             }
-            remaining = &remaining[start + 2 + end + 1..];
+            remaining = &remaining[inner_start + end + 1..];
         } else {
             result.push_str(remaining);
             remaining = "";
@@ -1702,6 +1909,40 @@ fn resolve_interpolated_string(s: &str, ctx: &EvalContext) -> serde_json::Value 
     result.push_str(remaining);
 
     serde_json::Value::String(result)
+}
+
+/// Find the position of the matching closing brace `}`, accounting for
+/// nested parentheses and brackets in expressions like `concat(a[*].id, b[*].id)`.
+fn find_matching_brace(s: &str) -> Option<usize> {
+    let mut depth_paren = 0i32;
+    let mut depth_bracket = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth_paren += 1,
+            ')' => depth_paren -= 1,
+            '[' => depth_bracket += 1,
+            ']' => depth_bracket -= 1,
+            '}' if depth_paren == 0 && depth_bracket == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Try to evaluate a string as an HCL expression by wrapping it in a dummy
+/// attribute and parsing with the HCL parser. This handles function calls,
+/// splat expressions, and other complex HCL syntax.
+fn try_eval_hcl_expression(expr_str: &str, ctx: &EvalContext) -> Option<serde_json::Value> {
+    let dummy = format!("x = {}", expr_str);
+    let body: hcl::Body = hcl::from_str(&dummy).ok()?;
+    let attr = body.attributes().next()?;
+    let expr = crate::hcl::parser::hcl_expr_to_expression(attr.expr());
+    let result = eval_expression(&expr, ctx);
+    if result.is_null() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 /// Build a map of variable name -> default JSON value from workspace variables.
@@ -2355,6 +2596,46 @@ fn collect_dependencies(
 }
 
 /// Convert a ResourceIndex to a JSON value for the plan output.
+/// Implement `cidrsubnet(prefix, newbits, netnum)`.
+/// Example: `cidrsubnet("10.0.0.0/16", 8, 1)` → `"10.0.1.0/24"`
+fn cidrsubnet_impl(prefix: &str, newbits: u32, netnum: u32) -> serde_json::Value {
+    let Some((ip_str, mask_str)) = prefix.split_once('/') else {
+        return serde_json::Value::Null;
+    };
+    let mask: u32 = mask_str.parse().unwrap_or(0);
+    let new_mask = mask + newbits;
+    if new_mask > 32 {
+        tracing::warn!("cidrsubnet: new prefix length {} exceeds 32", new_mask);
+        return serde_json::Value::Null;
+    }
+    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else {
+        return serde_json::Value::Null;
+    };
+    let ip_u32 = u32::from(ip);
+    let network_mask = if mask == 0 { 0 } else { !0u32 << (32 - mask) };
+    let network = ip_u32 & network_mask;
+    let subnet = netnum << (32 - new_mask);
+    let result_ip = std::net::Ipv4Addr::from(network | subnet);
+    serde_json::Value::String(format!("{}/{}", result_ip, new_mask))
+}
+
+/// Implement `cidrhost(prefix, hostnum)`.
+/// Example: `cidrhost("10.0.1.0/24", 5)` → `"10.0.1.5"`
+fn cidrhost_impl(prefix: &str, hostnum: u32) -> serde_json::Value {
+    let Some((ip_str, mask_str)) = prefix.split_once('/') else {
+        return serde_json::Value::Null;
+    };
+    let mask: u32 = mask_str.parse().unwrap_or(0);
+    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else {
+        return serde_json::Value::Null;
+    };
+    let ip_u32 = u32::from(ip);
+    let network_mask = if mask == 0 { 0 } else { !0u32 << (32 - mask) };
+    let network = ip_u32 & network_mask;
+    let result_ip = std::net::Ipv4Addr::from(network | hostnum);
+    serde_json::Value::String(result_ip.to_string())
+}
+
 fn resource_index_to_json(
     index: Option<&crate::config::types::ResourceIndex>,
 ) -> Option<serde_json::Value> {

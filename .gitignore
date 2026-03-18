@@ -17,6 +17,7 @@ Thumbs.db
 
 # Infrastructure configs (local testing)
 infra/
+infra2/
 
 # Test directories
 test_minimal/
