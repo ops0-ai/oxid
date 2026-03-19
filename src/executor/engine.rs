@@ -181,6 +181,7 @@ impl ResourceEngine {
         workspace_id: &str,
         refresh: bool,
         targets: &[String],
+        destroy: bool,
     ) -> Result<PlanSummary> {
         let provider_map = build_provider_map(workspace);
         let var_defaults = build_variable_defaults(workspace);
@@ -371,12 +372,19 @@ impl ResourceEngine {
                         prior_state_padded.clone()
                     };
 
+                    // In destroy mode, propose null (delete) for resources that exist;
+                    // skip resources that don't exist in state.
+                    let proposed_new = if destroy { None } else { Some(&config_json) };
+                    if destroy && prior_state.is_none() {
+                        continue;
+                    }
+
                     let plan_result = match pm
                         .plan_resource(
                             provider_source,
                             resource_type,
                             prior_state.as_ref(),
-                            Some(&config_json),
+                            proposed_new,
                             &config_json,
                         )
                         .await
@@ -388,11 +396,15 @@ impl ResourceEngine {
                         }
                     };
 
-                    let action = determine_action(
-                        prior_state.as_ref(),
-                        plan_result.planned_state.as_ref(),
-                        &plan_result.requires_replace,
-                    );
+                    let action = if destroy && prior_state.is_some() {
+                        ResourceAction::Delete
+                    } else {
+                        determine_action(
+                            prior_state.as_ref(),
+                            plan_result.planned_state.as_ref(),
+                            &plan_result.requires_replace,
+                        )
+                    };
 
                     changes.push(PlannedChange {
                         address: address.clone(),

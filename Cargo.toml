@@ -1,6 +1,6 @@
 [package]
 name = "oxid"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "Standalone infrastructure-as-code engine — OSS alternative to Terraform/OpenTofu"
 license = "Apache-2.0"

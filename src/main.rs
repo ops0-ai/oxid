@@ -80,6 +80,10 @@ enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         refresh: bool,
 
+        /// Generate a destroy plan (mark all resources for deletion)
+        #[arg(long)]
+        destroy: bool,
+
         /// Save plan to a file for later use with `oxid show` or `oxid apply`
         #[arg(long = "out")]
         out_file: Option<String>,
@@ -259,8 +263,9 @@ async fn main() -> Result<()> {
             ref target,
             json,
             refresh,
+            destroy,
             ref out_file,
-        } => cmd_plan(&cli, target, json, refresh, out_file.as_deref()).await,
+        } => cmd_plan(&cli, target, json, refresh, destroy, out_file.as_deref()).await,
         Commands::Show {
             ref plan_file,
             json,
@@ -545,6 +550,7 @@ async fn cmd_plan(
     targets: &[String],
     json: bool,
     refresh: bool,
+    destroy: bool,
     out_file: Option<&str>,
 ) -> Result<()> {
     let workspace = loader::load_workspace(Path::new(&cli.config))?;
@@ -568,7 +574,7 @@ async fn cmd_plan(
     let engine = ResourceEngine::new(pm, cli.parallelism);
 
     let plan = engine
-        .plan(&workspace, &*backend, &ws.id, refresh, targets)
+        .plan(&workspace, &*backend, &ws.id, refresh, targets, destroy)
         .await?;
     engine.shutdown().await?;
 
@@ -631,7 +637,7 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
 
     // Plan first
     let plan = engine
-        .plan(&workspace, &*backend, &ws.id, true, targets)
+        .plan(&workspace, &*backend, &ws.id, true, targets, false)
         .await?;
     output::formatter::print_resource_plan(&plan, &[]);
 
