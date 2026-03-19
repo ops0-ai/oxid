@@ -166,6 +166,16 @@ enum Commands {
         no_refresh: bool,
     },
 
+    /// Show output values from state
+    Output {
+        /// Show a specific output by name
+        name: Option<String>,
+
+        /// Output as JSON (Terraform-compatible format)
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Validate configuration without running anything
     Validate,
 }
@@ -288,6 +298,7 @@ async fn main() -> Result<()> {
         Commands::Graph { ref graph_type } => cmd_graph(&cli, graph_type).await,
         Commands::Providers => cmd_providers(&cli).await,
         Commands::Drift { no_refresh } => cmd_drift(&cli, !no_refresh).await,
+        Commands::Output { ref name, json } => cmd_output(&cli, name.as_deref(), json).await,
         Commands::Validate => cmd_validate(&cli).await,
     }
 }
@@ -1592,6 +1603,130 @@ fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+async fn cmd_output(cli: &Cli, name: Option<&str>, json: bool) -> Result<()> {
+    let backend = open_backend(&cli.working_dir).await?;
+    backend.initialize().await?;
+
+    let ws = backend
+        .get_workspace(DEFAULT_WORKSPACE)
+        .await?
+        .context("No default workspace. Run 'oxid init' first.")?;
+
+    let outputs = backend.list_outputs(&ws.id, None).await?;
+
+    // If a specific output name is requested
+    if let Some(output_name) = name {
+        let output = outputs.iter().find(|o| o.output_name == output_name);
+
+        match output {
+            Some(o) => {
+                if json {
+                    // Terraform-compatible single output JSON format
+                    let value: serde_json::Value = serde_json::from_str(&o.output_value)
+                        .unwrap_or_else(|_| serde_json::Value::String(o.output_value.clone()));
+                    let entry = serde_json::json!({
+                        "sensitive": o.sensitive,
+                        "type": infer_output_type(&value),
+                        "value": value,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                } else if o.sensitive {
+                    println!("{} = <sensitive>", o.output_name);
+                } else {
+                    // Try to parse as JSON for pretty display, else raw string
+                    let value: serde_json::Value = serde_json::from_str(&o.output_value)
+                        .unwrap_or_else(|_| serde_json::Value::String(o.output_value.clone()));
+                    match value {
+                        serde_json::Value::String(s) => println!("{}", s),
+                        _ => println!("{}", serde_json::to_string_pretty(&value)?),
+                    }
+                }
+            }
+            None => bail!("Output \"{}\" not found.", output_name),
+        }
+        return Ok(());
+    }
+
+    // List all outputs
+    if outputs.is_empty() {
+        if !json {
+            println!("{}", "No outputs found.".dimmed());
+        } else {
+            println!("{{}}");
+        }
+        return Ok(());
+    }
+
+    if json {
+        // Terraform-compatible JSON format: { "name": { "sensitive": bool, "type": ..., "value": ... } }
+        let mut map = serde_json::Map::new();
+        for o in &outputs {
+            let value: serde_json::Value = serde_json::from_str(&o.output_value)
+                .unwrap_or_else(|_| serde_json::Value::String(o.output_value.clone()));
+            map.insert(
+                o.output_name.clone(),
+                serde_json::json!({
+                    "sensitive": o.sensitive,
+                    "type": infer_output_type(&value),
+                    "value": value,
+                }),
+            );
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(map))?
+        );
+    } else {
+        for o in &outputs {
+            if o.sensitive {
+                println!("{} = <sensitive>", o.output_name);
+            } else {
+                let value: serde_json::Value = serde_json::from_str(&o.output_value)
+                    .unwrap_or_else(|_| serde_json::Value::String(o.output_value.clone()));
+                match value {
+                    serde_json::Value::String(s) => {
+                        println!("{} = \"{}\"", o.output_name, s);
+                    }
+                    _ => {
+                        println!(
+                            "{} = {}",
+                            o.output_name,
+                            serde_json::to_string_pretty(&value)?
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Infer a Terraform-compatible type string from a JSON value.
+fn infer_output_type(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(_) => serde_json::json!("string"),
+        serde_json::Value::Number(_) => serde_json::json!("number"),
+        serde_json::Value::Bool(_) => serde_json::json!("bool"),
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                serde_json::json!(["tuple", []])
+            } else {
+                let elem_type = infer_output_type(&arr[0]);
+                serde_json::json!(["list", elem_type])
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            let mut types = serde_json::Map::new();
+            for (k, v) in obj {
+                types.insert(k.clone(), infer_output_type(v));
+            }
+            serde_json::json!(["object", types])
+        }
+        serde_json::Value::Null => serde_json::json!("string"),
     }
 }
 
