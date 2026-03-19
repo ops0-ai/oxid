@@ -833,10 +833,10 @@ struct TfInstance {
     #[serde(default)]
     attributes: serde_json::Value,
     #[serde(default)]
-    sensitive_attributes: Vec<String>,
+    sensitive_attributes: serde_json::Value,
     #[serde(default)]
     #[allow(dead_code)]
-    dependencies: Vec<String>,
+    dependencies: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
