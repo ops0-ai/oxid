@@ -182,6 +182,13 @@ pub struct ImportResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SyncResult {
+    pub updated: usize,
+    pub added: usize,
+    pub removed: usize,
+}
+
 // ─── Legacy types (kept for backward compatibility) ─────────────────────────
 
 #[derive(Debug, Clone)]

@@ -121,6 +121,13 @@ enum Commands {
         auto_approve: bool,
     },
 
+    /// Sync state from Terraform remote backend (S3/GCS/Azure) or local tfstate
+    Sync {
+        /// Path to a local .tfstate file (overrides remote backend detection)
+        #[arg(long)]
+        state_file: Option<String>,
+    },
+
     /// Manage state
     State {
         #[command(subcommand)]
@@ -288,6 +295,7 @@ async fn main() -> Result<()> {
             ref target,
             auto_approve,
         } => cmd_destroy(&cli, target, auto_approve).await,
+        Commands::Sync { ref state_file } => cmd_sync(&cli, state_file.as_deref()).await,
         Commands::State { ref command } => cmd_state(&cli, command).await,
         Commands::Import { ref command } => cmd_import(&cli, command).await,
         Commands::Query {
@@ -746,6 +754,94 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
             println!("{:<width$} = {}", output.name, display, width = name_width);
         }
     }
+
+    Ok(())
+}
+
+async fn cmd_sync(cli: &Cli, state_file: Option<&str>) -> Result<()> {
+    let config_path = Path::new(&cli.config);
+    let backend = open_backend(&cli.working_dir).await?;
+    backend.initialize().await?;
+
+    let ws = backend
+        .get_workspace(DEFAULT_WORKSPACE)
+        .await?
+        .context("No default workspace. Run 'oxid init' first.")?;
+
+    let state_json = if let Some(path) = state_file {
+        // User provided a local file
+        println!("  {} Reading state from: {}", "→".blue(), path);
+        std::fs::read_to_string(path).context(format!("Failed to read state file: {}", path))?
+    } else {
+        // Try local terraform.tfstate first
+        let local_tfstate = config_path.join("terraform.tfstate");
+        let local_path = if local_tfstate.exists() {
+            Some(local_tfstate)
+        } else if Path::new("terraform.tfstate").exists() {
+            Some(Path::new("terraform.tfstate").to_path_buf())
+        } else {
+            None
+        };
+
+        if let Some(ref path) = local_path {
+            println!(
+                "  {} Syncing from local state: {}",
+                "→".blue(),
+                path.display()
+            );
+            std::fs::read_to_string(path).context(format!("Failed to read {}", path.display()))?
+        } else {
+            // Try remote backend
+            let workspace_config = crate::hcl::parse_directory(config_path)
+                .context("No .tf files found. Run from a Terraform directory.")?;
+            let remote_backend = workspace_config
+                .terraform_settings
+                .as_ref()
+                .and_then(|ts| ts.backend.as_ref())
+                .context(
+                    "No local terraform.tfstate and no remote backend configured.\n  \
+                     Use --state-file to specify a state file path.",
+                )?;
+
+            match remote_backend {
+                crate::config::types::BackendConfig::S3 {
+                    bucket,
+                    key,
+                    region,
+                    ..
+                } => {
+                    println!("  {} Syncing from S3: s3://{}/{}", "→".blue(), bucket, key);
+                    println!(
+                        "  {} Region: {}",
+                        "→".blue(),
+                        region.as_deref().unwrap_or("default")
+                    );
+                }
+                crate::config::types::BackendConfig::Unsupported { backend_type } => {
+                    bail!(
+                        "Backend '{}' is not yet supported for remote sync.\n  \
+                         Supported: s3\n  \
+                         Workaround: download the state file and use --state-file",
+                        backend_type
+                    );
+                }
+            }
+
+            println!("{}", "  Fetching remote state...".dimmed());
+            crate::state::remote::fetch_remote_state(remote_backend)
+                .await
+                .context("Failed to fetch remote state")?
+        }
+    };
+
+    let result = backend.sync_tfstate(&ws.id, &state_json).await?;
+
+    println!(
+        "\n  {} Sync complete: {} resource(s) synced, {} removed",
+        "✓".green().bold(),
+        result.updated,
+        result.removed,
+    );
 
     Ok(())
 }

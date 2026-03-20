@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 use super::models::{
     ImportResult, Lock, LockInfo, OutputValue, ResourceFilter, ResourceResult, ResourceState,
-    RunRecord, Workspace,
+    RunRecord, SyncResult, Workspace,
 };
 
 /// Pluggable state backend trait.
@@ -156,6 +156,11 @@ pub trait StateBackend: Send + Sync {
 
     /// Import resources from a terraform .tfstate JSON string.
     async fn import_tfstate(&self, workspace_id: &str, state_json: &str) -> Result<ImportResult>;
+
+    /// Sync resources from a terraform .tfstate JSON string.
+    /// Unlike import, this upserts (overwrites existing) and removes resources
+    /// that are no longer present in the state file.
+    async fn sync_tfstate(&self, workspace_id: &str, state_json: &str) -> Result<SyncResult>;
 
     // ─── Providers ──────────────────────────────────────────────────────────
 

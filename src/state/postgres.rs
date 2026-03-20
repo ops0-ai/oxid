@@ -838,6 +838,124 @@ impl StateBackend for PostgresBackend {
         })
     }
 
+    async fn sync_tfstate(&self, workspace_id: &str, state_json: &str) -> Result<SyncResult> {
+        let state: TfState =
+            serde_json::from_str(state_json).context("Failed to parse .tfstate JSON")?;
+
+        let mut added = 0usize;
+        let mut updated = 0usize;
+        let now = Self::now_dt();
+        let mut seen_addresses = Vec::new();
+
+        for tf_resource in &state.resources {
+            for (idx, instance) in tf_resource.instances.iter().enumerate() {
+                let address = if let Some(ref key) = instance.index_key {
+                    format!(
+                        "{}.{}[{}]",
+                        tf_resource.resource_type, tf_resource.name, key
+                    )
+                } else if tf_resource.instances.len() > 1 {
+                    format!(
+                        "{}.{}[{}]",
+                        tf_resource.resource_type, tf_resource.name, idx
+                    )
+                } else {
+                    format!("{}.{}", tf_resource.resource_type, tf_resource.name)
+                };
+                seen_addresses.push(address.clone());
+
+                let id = uuid::Uuid::new_v4().to_string();
+                let attrs: serde_json::Value = instance.attributes.clone();
+                let sensitive: serde_json::Value =
+                    serde_json::to_value(&instance.sensitive_attributes)
+                        .unwrap_or(serde_json::json!([]));
+
+                let result = sqlx::query(
+                    "INSERT INTO resources (id, workspace_id, module_path, resource_type, resource_name,
+                        resource_mode, provider_source, index_key, address, status,
+                        attributes_json, sensitive_attrs, schema_version, created_at, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                     ON CONFLICT(workspace_id, address) DO UPDATE SET
+                        attributes_json = EXCLUDED.attributes_json,
+                        sensitive_attrs = EXCLUDED.sensitive_attrs,
+                        provider_source = EXCLUDED.provider_source,
+                        status = EXCLUDED.status,
+                        updated_at = EXCLUDED.updated_at",
+                )
+                .bind(&id)
+                .bind(workspace_id)
+                .bind("")
+                .bind(&tf_resource.resource_type)
+                .bind(&tf_resource.name)
+                .bind(&tf_resource.mode)
+                .bind(&tf_resource.provider)
+                .bind(&instance.index_key)
+                .bind(&address)
+                .bind("created")
+                .bind(attrs)
+                .bind(sensitive)
+                .bind(instance.schema_version.unwrap_or(0))
+                .bind(now)
+                .bind(now)
+                .execute(&self.pool)
+                .await;
+
+                match result {
+                    Ok(r) if r.rows_affected() > 0 => {
+                        // Check if it was an insert or update by checking created_at
+                        // For simplicity, count all as updated; new ones as added
+                        added += 1;
+                    }
+                    Ok(_) => updated += 1,
+                    Err(e) => {
+                        tracing::warn!("Failed to sync {}: {}", address, e);
+                    }
+                }
+            }
+        }
+
+        // Sync outputs (upsert)
+        for (name, output) in &state.outputs {
+            let id = uuid::Uuid::new_v4().to_string();
+            let value_str = serde_json::to_string(&output.value).unwrap_or_default();
+            let _ = sqlx::query(
+                "INSERT INTO resource_outputs (id, workspace_id, module_path, output_name, output_value, sensitive)
+                 VALUES ($1, $2, '', $3, $4, $5)
+                 ON CONFLICT(workspace_id, module_path, output_name) DO UPDATE SET
+                    output_value = EXCLUDED.output_value,
+                    sensitive = EXCLUDED.sensitive",
+            )
+            .bind(&id)
+            .bind(workspace_id)
+            .bind(name)
+            .bind(&value_str)
+            .bind(output.sensitive.unwrap_or(false))
+            .execute(&self.pool)
+            .await;
+        }
+
+        // Remove resources no longer in the state file
+        let existing = self
+            .list_resources(
+                workspace_id,
+                &crate::state::models::ResourceFilter::default(),
+            )
+            .await?;
+        let mut removed = 0usize;
+        for res in &existing {
+            if !seen_addresses.contains(&res.address) {
+                let _ = self.delete_resource(workspace_id, &res.address).await;
+                removed += 1;
+            }
+        }
+
+        Ok(SyncResult {
+            updated: added + updated,
+            added,
+            removed,
+        })
+    }
+
     // ─── Providers ──────────────────────────────────────────────────────────
 
     async fn register_provider(
