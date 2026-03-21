@@ -663,6 +663,13 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
     if plan.creates == 0 && plan.updates == 0 && plan.deletes == 0 && plan.replaces == 0 {
         println!("\n{}", "No changes. Infrastructure is up-to-date.".green());
         engine.shutdown().await?;
+
+        // Still store outputs even when no resource changes
+        if !workspace.outputs.is_empty() {
+            let backend_arc: Arc<dyn StateBackend> = Arc::from(backend);
+            store_outputs(&workspace, &backend_arc, &ws.id).await;
+        }
+
         return Ok(());
     }
 
@@ -718,44 +725,64 @@ async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<
 
     // Evaluate and print outputs
     if !workspace.outputs.is_empty() && summary.failed == 0 {
-        // Load all resource states from the backend into a DashMap for expression evaluation
-        let resource_states: Arc<dashmap::DashMap<String, serde_json::Value>> =
-            Arc::new(dashmap::DashMap::new());
-        let all_resources = backend_arc
-            .list_resources(&ws.id, &crate::state::models::ResourceFilter::default())
-            .await?;
-        for r in &all_resources {
+        store_outputs(&workspace, &backend_arc, &ws.id).await;
+    }
+
+    Ok(())
+}
+
+async fn store_outputs(
+    workspace: &config::types::WorkspaceConfig,
+    backend: &Arc<dyn StateBackend>,
+    workspace_id: &str,
+) {
+    let resource_states: Arc<dashmap::DashMap<String, serde_json::Value>> =
+        Arc::new(dashmap::DashMap::new());
+    let all_resources = backend
+        .list_resources(
+            workspace_id,
+            &crate::state::models::ResourceFilter::default(),
+        )
+        .await;
+    if let Ok(resources) = all_resources {
+        for r in &resources {
             if let Ok(attrs) = serde_json::from_str::<serde_json::Value>(&r.attributes_json) {
                 resource_states.insert(r.address.clone(), attrs);
             }
         }
-
-        let var_defaults = executor::engine::build_variable_defaults(&workspace);
-        let eval_ctx =
-            executor::engine::EvalContext::with_states(var_defaults, Arc::clone(&resource_states));
-
-        println!();
-        println!("{}:", "Outputs".bold());
-        println!();
-        let name_width = workspace
-            .outputs
-            .iter()
-            .map(|o| o.name.len())
-            .max()
-            .unwrap_or(10);
-
-        for output in &workspace.outputs {
-            let value = executor::engine::eval_expression(&output.value, &eval_ctx);
-            let display = if output.sensitive {
-                "<sensitive>".to_string()
-            } else {
-                output::formatter::format_output_value(&value, 0)
-            };
-            println!("{:<width$} = {}", output.name, display, width = name_width);
-        }
     }
 
-    Ok(())
+    let var_defaults = executor::engine::build_variable_defaults(workspace);
+    let eval_ctx =
+        executor::engine::EvalContext::with_states(var_defaults, Arc::clone(&resource_states));
+
+    println!();
+    println!("{}:", "Outputs".bold());
+    println!();
+    let name_width = workspace
+        .outputs
+        .iter()
+        .map(|o| o.name.len())
+        .max()
+        .unwrap_or(10);
+
+    for output in &workspace.outputs {
+        let value = executor::engine::eval_expression(&output.value, &eval_ctx);
+        let display = if output.sensitive {
+            "<sensitive>".to_string()
+        } else {
+            output::formatter::format_output_value(&value, 0)
+        };
+        println!("{:<width$} = {}", output.name, display, width = name_width);
+
+        let value_str = serde_json::to_string(&value).unwrap_or_default();
+        if let Err(e) = backend
+            .set_output(workspace_id, "", &output.name, &value_str, output.sensitive)
+            .await
+        {
+            tracing::warn!("Failed to store output '{}': {}", output.name, e);
+        }
+    }
 }
 
 async fn cmd_sync(cli: &Cli, state_file: Option<&str>) -> Result<()> {

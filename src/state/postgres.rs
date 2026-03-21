@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Column, PgPool, Row};
 
@@ -92,6 +93,16 @@ fn read_optional_ts(row: &sqlx::postgres::PgRow, col: &str) -> Option<String> {
         .map(|dt| dt.to_rfc3339())
 }
 
+// ─── Encryption helpers ─────────────────────────────────────────────────────
+
+/// Derive a deterministic encryption key from the database URL.
+/// Each database/project gets its own unique AES-256 key automatically.
+fn derive_encryption_key() -> String {
+    let url = std::env::var("OXID_DATABASE_URL").unwrap_or_default();
+    let hash = Sha256::digest(url.as_bytes());
+    hex::encode(hash)
+}
+
 // ─── JSONB helpers ───────────────────────────────────────────────────────────
 
 /// Parse a JSON string into serde_json::Value for binding to JSONB columns.
@@ -135,6 +146,11 @@ impl StateBackend for PostgresBackend {
                 .await?;
             }
         }
+
+        // Enable pgcrypto for sensitive output encryption
+        let _ = sqlx::query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            .execute(&self.pool)
+            .await;
 
         // Create tables using Postgres-native DDL
         for statement in postgres_schema::PG_CREATE_TABLES_SQL.split(';') {
@@ -502,9 +518,13 @@ impl StateBackend for PostgresBackend {
         sensitive: bool,
     ) -> Result<()> {
         let id = uuid::Uuid::new_v4().to_string();
+        let key = derive_encryption_key();
         sqlx::query(
             "INSERT INTO resource_outputs (id, workspace_id, module_path, output_name, output_value, sensitive)
-             VALUES ($1, $2, $3, $4, $5, $6)
+             VALUES ($1, $2, $3, $4,
+               CASE WHEN $6 THEN encode(pgp_sym_encrypt($5::text, $7::text), 'base64')
+                    ELSE $5 END,
+               $6)
              ON CONFLICT(workspace_id, module_path, output_name) DO UPDATE SET
                 output_value = EXCLUDED.output_value, sensitive = EXCLUDED.sensitive",
         )
@@ -514,6 +534,7 @@ impl StateBackend for PostgresBackend {
         .bind(name)
         .bind(value)
         .bind(sensitive)
+        .bind(&key)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -525,13 +546,18 @@ impl StateBackend for PostgresBackend {
         module_path: &str,
         name: &str,
     ) -> Result<Option<OutputValue>> {
+        let key = derive_encryption_key();
         let row = sqlx::query(
-            "SELECT id, workspace_id, module_path, output_name, output_value, sensitive
+            "SELECT id, workspace_id, module_path, output_name,
+               CASE WHEN sensitive THEN pgp_sym_decrypt(decode(output_value, 'base64'), $4::text)
+                    ELSE output_value END AS output_value,
+               sensitive
              FROM resource_outputs WHERE workspace_id = $1 AND module_path = $2 AND output_name = $3",
         )
         .bind(workspace_id)
         .bind(module_path)
         .bind(name)
+        .bind(&key)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -550,21 +576,30 @@ impl StateBackend for PostgresBackend {
         workspace_id: &str,
         module_path: Option<&str>,
     ) -> Result<Vec<OutputValue>> {
+        let key = derive_encryption_key();
         let rows = if let Some(mp) = module_path {
             sqlx::query(
-                "SELECT id, workspace_id, module_path, output_name, output_value, sensitive
+                "SELECT id, workspace_id, module_path, output_name,
+                   CASE WHEN sensitive THEN pgp_sym_decrypt(decode(output_value, 'base64'), $3::text)
+                        ELSE output_value END AS output_value,
+                   sensitive
                  FROM resource_outputs WHERE workspace_id = $1 AND module_path = $2 ORDER BY output_name",
             )
             .bind(workspace_id)
             .bind(mp)
+            .bind(&key)
             .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT id, workspace_id, module_path, output_name, output_value, sensitive
+                "SELECT id, workspace_id, module_path, output_name,
+                   CASE WHEN sensitive THEN pgp_sym_decrypt(decode(output_value, 'base64'), $2::text)
+                        ELSE output_value END AS output_value,
+                   sensitive
                  FROM resource_outputs WHERE workspace_id = $1 ORDER BY module_path, output_name",
             )
             .bind(workspace_id)
+            .bind(&key)
             .fetch_all(&self.pool)
             .await?
         };
@@ -812,21 +847,27 @@ impl StateBackend for PostgresBackend {
             }
         }
 
-        // Import outputs
+        // Import outputs (encrypt sensitive values)
+        let enc_key = derive_encryption_key();
         for (name, output) in &state.outputs {
             let id = uuid::Uuid::new_v4().to_string();
             let value_str = serde_json::to_string(&output.value).unwrap_or_default();
+            let sensitive = output.sensitive.unwrap_or(false);
             let _ = sqlx::query(
                 "INSERT INTO resource_outputs (id, workspace_id, module_path, output_name, output_value, sensitive)
-                 VALUES ($1, $2, '', $3, $4, $5)
+                 VALUES ($1, $2, '', $3,
+                   CASE WHEN $5 THEN encode(pgp_sym_encrypt($4::text, $6::text), 'base64')
+                        ELSE $4 END,
+                   $5)
                  ON CONFLICT(workspace_id, module_path, output_name) DO UPDATE SET
-                    output_value = EXCLUDED.output_value",
+                    output_value = EXCLUDED.output_value, sensitive = EXCLUDED.sensitive",
             )
             .bind(&id)
             .bind(workspace_id)
             .bind(name)
             .bind(&value_str)
-            .bind(output.sensitive.unwrap_or(false))
+            .bind(sensitive)
+            .bind(&enc_key)
             .execute(&self.pool)
             .await;
         }
@@ -914,13 +955,18 @@ impl StateBackend for PostgresBackend {
             }
         }
 
-        // Sync outputs (upsert)
+        // Sync outputs (upsert, encrypt sensitive values)
+        let enc_key = derive_encryption_key();
         for (name, output) in &state.outputs {
             let id = uuid::Uuid::new_v4().to_string();
             let value_str = serde_json::to_string(&output.value).unwrap_or_default();
+            let sensitive = output.sensitive.unwrap_or(false);
             let _ = sqlx::query(
                 "INSERT INTO resource_outputs (id, workspace_id, module_path, output_name, output_value, sensitive)
-                 VALUES ($1, $2, '', $3, $4, $5)
+                 VALUES ($1, $2, '', $3,
+                   CASE WHEN $5 THEN encode(pgp_sym_encrypt($4::text, $6::text), 'base64')
+                        ELSE $4 END,
+                   $5)
                  ON CONFLICT(workspace_id, module_path, output_name) DO UPDATE SET
                     output_value = EXCLUDED.output_value,
                     sensitive = EXCLUDED.sensitive",
@@ -929,7 +975,8 @@ impl StateBackend for PostgresBackend {
             .bind(workspace_id)
             .bind(name)
             .bind(&value_str)
-            .bind(output.sensitive.unwrap_or(false))
+            .bind(sensitive)
+            .bind(&enc_key)
             .execute(&self.pool)
             .await;
         }
