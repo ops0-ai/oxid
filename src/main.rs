@@ -1394,16 +1394,36 @@ async fn cmd_blast_radius(
     for target in &target_addresses {
         let start_indices: Vec<petgraph::graph::NodeIndex> =
             if let Some(&idx) = node_map.get(target.as_str()) {
+                // Exact match (e.g. "aws_vpc.main" or "aws_subnet.public[0]")
                 vec![idx]
             } else {
-                node_map
+                // Try base address match (e.g. "aws_subnet.public" matches "aws_subnet.public[0]")
+                let by_base: Vec<_> = node_map
                     .iter()
                     .filter(|(addr, _)| {
                         let node = &graph[*node_map.get(addr.as_str()).unwrap()];
                         node.base_address() == target.as_str()
                     })
                     .map(|(_, &idx)| idx)
-                    .collect()
+                    .collect();
+                if !by_base.is_empty() {
+                    by_base
+                } else {
+                    // Try resource type match (e.g. "aws_subnet" matches all aws_subnet.*)
+                    node_map
+                        .values()
+                        .filter(|&&idx| match &graph[idx] {
+                            dag::resource_graph::DagNode::Resource { resource_type, .. } => {
+                                resource_type == target.as_str()
+                            }
+                            dag::resource_graph::DagNode::DataSource { resource_type, .. } => {
+                                resource_type == target.as_str()
+                            }
+                            _ => false,
+                        })
+                        .copied()
+                        .collect()
+                }
             };
 
         if start_indices.is_empty() {

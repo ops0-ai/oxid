@@ -343,6 +343,16 @@ fn evaluate_for_each(
                 })
                 .collect(),
         )),
+        serde_json::Value::Null | serde_json::Value::String(_) => {
+            // for_each references another resource (e.g. `for_each = aws_subnet.public`)
+            // which can't be resolved at DAG-build time. Treat as a single unindexed node;
+            // the dependency is still tracked via expression references.
+            tracing::debug!(
+                "for_each for {}.{} resolved to {:?} (likely a resource reference), treating as single node",
+                resource.resource_type, resource.name, val
+            );
+            Ok(None)
+        }
         _ => bail!(
             "for_each for {}.{} must evaluate to a map or set, got {:?}",
             resource.resource_type,
