@@ -185,6 +185,24 @@ enum Commands {
 
     /// Validate configuration without running anything
     Validate,
+
+    /// Assess blast radius of a resource change
+    BlastRadius {
+        /// Resource address (e.g. aws_vpc.main). Omit when using --plan.
+        resource: Option<String>,
+
+        /// Auto-detect changed resources from a plan and show blast radius for each
+        #[arg(long)]
+        plan: bool,
+
+        /// Only show resources that exist in state (deployed)
+        #[arg(long)]
+        state: bool,
+
+        /// Show upstream dependencies instead of downstream dependents
+        #[arg(long, alias = "why")]
+        reverse: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -308,6 +326,12 @@ async fn main() -> Result<()> {
         Commands::Drift { no_refresh } => cmd_drift(&cli, !no_refresh).await,
         Commands::Output { ref name, json } => cmd_output(&cli, name.as_deref(), json).await,
         Commands::Validate => cmd_validate(&cli).await,
+        Commands::BlastRadius {
+            ref resource,
+            plan,
+            state,
+            reverse,
+        } => cmd_blast_radius(&cli, resource.as_deref(), plan, state, reverse).await,
     }
 }
 
@@ -1267,6 +1291,335 @@ async fn cmd_graph(cli: &Cli, graph_type: &str) -> Result<()> {
             graph_type
         ),
     }
+
+    Ok(())
+}
+
+async fn cmd_blast_radius(
+    cli: &Cli,
+    resource: Option<&str>,
+    plan_mode: bool,
+    state_filter: bool,
+    reverse: bool,
+) -> Result<()> {
+    if !plan_mode && resource.is_none() {
+        bail!("Either provide a resource address or use --plan to auto-detect changed resources.");
+    }
+
+    let workspace = loader::load_workspace(Path::new(&cli.config))?;
+    let provider_map = executor::engine::build_provider_map(&workspace);
+    let var_defaults = executor::engine::build_variable_defaults(&workspace);
+    let (graph, node_map) =
+        dag::resource_graph::build_resource_dag(&workspace, &provider_map, &var_defaults)?;
+
+    // Build both directions: dependents (downstream) and dependencies (upstream)
+    let mut dependents: std::collections::HashMap<
+        petgraph::graph::NodeIndex,
+        Vec<petgraph::graph::NodeIndex>,
+    > = std::collections::HashMap::new();
+    let mut dependencies: std::collections::HashMap<
+        petgraph::graph::NodeIndex,
+        Vec<petgraph::graph::NodeIndex>,
+    > = std::collections::HashMap::new();
+    for edge in graph.edge_indices() {
+        if let Some((from, to)) = graph.edge_endpoints(edge) {
+            dependents.entry(from).or_default().push(to);
+            dependencies.entry(to).or_default().push(from);
+        }
+    }
+
+    // Choose traversal direction
+    let adjacency = if reverse { &dependencies } else { &dependents };
+
+    // Open backend once if needed for --state or --plan
+    let backend: Option<Box<dyn StateBackend>> = if state_filter || plan_mode {
+        let b = open_backend(&cli.working_dir).await?;
+        b.initialize().await?;
+        Some(b)
+    } else {
+        None
+    };
+
+    // Collect deployed addresses for --state filtering
+    let deployed_addresses: Option<std::collections::HashSet<String>> = if state_filter {
+        let b = backend.as_ref().unwrap();
+        let ws = b
+            .get_workspace(DEFAULT_WORKSPACE)
+            .await?
+            .context("No default workspace. Run 'oxid init' first.")?;
+        let resources = b
+            .list_resources(&ws.id, &crate::state::models::ResourceFilter::default())
+            .await?;
+        Some(resources.iter().map(|r| r.address.clone()).collect())
+    } else {
+        None
+    };
+
+    // Determine target resources
+    let target_addresses: Vec<String> = if plan_mode {
+        let b = backend.as_ref().unwrap();
+        let ws = b
+            .get_workspace(DEFAULT_WORKSPACE)
+            .await?
+            .context("No default workspace. Run 'oxid init' first.")?;
+        let pm = Arc::new(provider_manager(&cli.working_dir));
+        let engine = ResourceEngine::new(pm, cli.parallelism);
+        let plan = engine
+            .plan(&workspace, &**b, &ws.id, true, &[], false)
+            .await?;
+        engine.shutdown().await?;
+
+        if plan.creates == 0 && plan.updates == 0 && plan.deletes == 0 && plan.replaces == 0 {
+            println!(
+                "\n{}",
+                "No changes detected. Infrastructure is up-to-date.".green()
+            );
+            return Ok(());
+        }
+
+        output::formatter::print_resource_plan(&plan, &[]);
+        println!();
+
+        plan.changes
+            .iter()
+            .filter(|c| c.action != executor::engine::ResourceAction::NoOp)
+            .map(|c| c.address.clone())
+            .collect()
+    } else {
+        vec![resource.unwrap().to_string()]
+    };
+
+    // Process each target resource
+    let mut grand_total = 0usize;
+    for target in &target_addresses {
+        let start_indices: Vec<petgraph::graph::NodeIndex> =
+            if let Some(&idx) = node_map.get(target.as_str()) {
+                vec![idx]
+            } else {
+                node_map
+                    .iter()
+                    .filter(|(addr, _)| {
+                        let node = &graph[*node_map.get(addr.as_str()).unwrap()];
+                        node.base_address() == target.as_str()
+                    })
+                    .map(|(_, &idx)| idx)
+                    .collect()
+            };
+
+        if start_indices.is_empty() {
+            if !plan_mode {
+                bail!(
+                    "Resource '{}' not found in the dependency graph.\nRun 'oxid graph' to see all resources.",
+                    target
+                );
+            }
+            continue;
+        }
+
+        // BFS with depth tracking
+        let mut depth_map: std::collections::HashMap<petgraph::graph::NodeIndex, usize> =
+            std::collections::HashMap::new();
+        let mut queue: std::collections::VecDeque<(petgraph::graph::NodeIndex, usize)> =
+            std::collections::VecDeque::new();
+        for &start_idx in &start_indices {
+            queue.push_back((start_idx, 0));
+        }
+        while let Some((node, depth)) = queue.pop_front() {
+            if let Some(neighbors) = adjacency.get(&node) {
+                for &neighbor in neighbors {
+                    if !depth_map.contains_key(&neighbor) && !start_indices.contains(&neighbor) {
+                        depth_map.insert(neighbor, depth + 1);
+                        queue.push_back((neighbor, depth + 1));
+                    }
+                }
+            }
+        }
+
+        // Apply --state filter
+        if let Some(ref deployed) = deployed_addresses {
+            depth_map.retain(|&idx, _| {
+                let node = &graph[idx];
+                match node {
+                    dag::resource_graph::DagNode::Output { .. } => true,
+                    _ => deployed.contains(node.address()),
+                }
+            });
+        }
+
+        let target_label = if start_indices.len() == 1 {
+            graph[start_indices[0]].address().to_string()
+        } else {
+            target.clone()
+        };
+
+        let direction_label = if reverse {
+            "Dependencies of"
+        } else {
+            "Blast radius for"
+        };
+
+        println!();
+        println!(
+            "{}  {} {}",
+            if reverse { "🔍" } else { "💥" }.bold(),
+            direction_label,
+            target_label.bold().cyan()
+        );
+        println!();
+
+        if depth_map.is_empty() {
+            if reverse {
+                println!(
+                    "  {} No upstream dependencies — this is a root resource.",
+                    "✓".green()
+                );
+            } else {
+                println!(
+                    "  {} No other resources depend on this resource.",
+                    "✓".green()
+                );
+                println!(
+                    "  Changes to {} are isolated — safe to modify.",
+                    target_label
+                );
+            }
+            println!();
+            continue;
+        }
+
+        let total = depth_map.len();
+        grand_total += total;
+        let max_depth = depth_map.values().copied().max().unwrap_or(0);
+
+        if !reverse {
+            let severity = if total >= 10 {
+                "HIGH".red().bold()
+            } else if total >= 5 {
+                "MEDIUM".yellow().bold()
+            } else {
+                "LOW".green().bold()
+            };
+            println!(
+                "  Severity: {}  ({} resources, {} levels deep)",
+                severity, total, max_depth
+            );
+        } else {
+            println!(
+                "  {} upstream dependencies, {} levels deep",
+                total.to_string().bold(),
+                max_depth
+            );
+        }
+        println!();
+
+        // Type summary
+        let mut type_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for &idx in depth_map.keys() {
+            let node = &graph[idx];
+            let type_name = match node {
+                dag::resource_graph::DagNode::Resource { resource_type, .. } => {
+                    resource_type.clone()
+                }
+                dag::resource_graph::DagNode::DataSource { resource_type, .. } => {
+                    format!("data.{}", resource_type)
+                }
+                dag::resource_graph::DagNode::Output { .. } => "output".to_string(),
+            };
+            *type_counts.entry(type_name).or_insert(0) += 1;
+        }
+        print!("  Types: ");
+        let type_strs: Vec<String> = type_counts
+            .iter()
+            .map(|(t, c)| format!("{} {}", c, t))
+            .collect();
+        println!("{}", type_strs.join(", "));
+        println!();
+
+        // Group by depth level
+        let mut by_depth: std::collections::BTreeMap<
+            usize,
+            Vec<(petgraph::graph::NodeIndex, &str)>,
+        > = std::collections::BTreeMap::new();
+        for (&idx, &depth) in &depth_map {
+            by_depth
+                .entry(depth)
+                .or_default()
+                .push((idx, graph[idx].address()));
+        }
+
+        for (depth, mut entries) in by_depth {
+            entries.sort_by_key(|(_, addr)| *addr);
+            let level_label = if reverse {
+                if depth == 1 {
+                    "direct dependency"
+                } else {
+                    "transitive dependency"
+                }
+            } else if depth == 1 {
+                "direct dependent"
+            } else {
+                "transitive dependent"
+            };
+            println!(
+                "  {} Depth {} — {} ({} resources):",
+                "▸".yellow(),
+                depth,
+                level_label.dimmed(),
+                entries.len()
+            );
+            for (idx, addr) in &entries {
+                let symbol = match &graph[*idx] {
+                    dag::resource_graph::DagNode::Resource { .. } => "~".yellow(),
+                    dag::resource_graph::DagNode::DataSource { .. } => "~".blue(),
+                    dag::resource_graph::DagNode::Output { .. } => "~".dimmed(),
+                };
+                let kind = match &graph[*idx] {
+                    dag::resource_graph::DagNode::Output { .. } => " (output)".dimmed(),
+                    dag::resource_graph::DagNode::DataSource { .. } => " (data)".dimmed(),
+                    _ => "".normal(),
+                };
+                println!("    {} {}{}", symbol, addr, kind);
+            }
+            println!();
+        }
+
+        if reverse {
+            println!(
+                "  {} {} depends on {} upstream resource(s).",
+                "ℹ".blue(),
+                target_label.bold(),
+                total
+            );
+        } else {
+            println!(
+                "  {} Changing {} may affect {} other resource(s) across {} level(s).",
+                "⚠".yellow(),
+                target_label.bold(),
+                total,
+                max_depth
+            );
+        }
+    }
+
+    if plan_mode && target_addresses.len() > 1 {
+        println!();
+        let overall_severity = if grand_total >= 20 {
+            "HIGH".red().bold()
+        } else if grand_total >= 10 {
+            "MEDIUM".yellow().bold()
+        } else {
+            "LOW".green().bold()
+        };
+        println!(
+            "  {} Overall blast radius: {} — {} changed resource(s), {} total dependent(s)",
+            "📊".bold(),
+            overall_severity,
+            target_addresses.len(),
+            grand_total
+        );
+    }
+    println!();
 
     Ok(())
 }
