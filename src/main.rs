@@ -203,6 +203,20 @@ enum Commands {
         #[arg(long, alias = "why")]
         reverse: bool,
     },
+
+    /// Show change history for a resource
+    History {
+        /// Resource address (e.g. aws_vpc.main)
+        address: String,
+
+        /// Maximum number of history entries to show
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -332,6 +346,11 @@ async fn main() -> Result<()> {
             state,
             reverse,
         } => cmd_blast_radius(&cli, resource.as_deref(), plan, state, reverse).await,
+        Commands::History {
+            ref address,
+            limit,
+            json,
+        } => cmd_history(&cli, address, limit, json).await,
     }
 }
 
@@ -1291,6 +1310,222 @@ async fn cmd_graph(cli: &Cli, graph_type: &str) -> Result<()> {
             graph_type
         ),
     }
+
+    Ok(())
+}
+
+async fn cmd_history(cli: &Cli, address: &str, limit: usize, json: bool) -> Result<()> {
+    let backend = open_backend(&cli.working_dir).await?;
+    backend.initialize().await?;
+
+    let ws = backend
+        .get_workspace(DEFAULT_WORKSPACE)
+        .await?
+        .context("No default workspace. Run 'oxid init' first.")?;
+
+    let entries = backend.get_resource_history(&ws.id, address, limit).await?;
+
+    if entries.is_empty() {
+        println!("\nNo history found for {}.", address.bold());
+        println!(
+            "History is recorded when resources are created, updated, or destroyed via {}.",
+            "oxid apply".cyan()
+        );
+        println!();
+        return Ok(());
+    }
+
+    if json {
+        let json_val = serde_json::to_string_pretty(&entries)?;
+        println!("{}", json_val);
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{}  Change history for {}",
+        "📋".bold(),
+        address.bold().cyan()
+    );
+    println!();
+
+    // Parse all entries' attributes upfront for diffing
+    let parsed_entries: Vec<Option<serde_json::Value>> = entries
+        .iter()
+        .map(|e| {
+            e.attributes_json
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+        })
+        .collect();
+
+    for (i, entry) in entries.iter().enumerate() {
+        let action_display = match entry.action.as_str() {
+            "create" => "+  create".green(),
+            "update" => "~  update".yellow(),
+            "delete" => "-  delete".red(),
+            "replace-destroy" => "-/+ replace".magenta(),
+            other => other.normal(),
+        };
+
+        // Relative time
+        let relative = if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.captured_at) {
+            let ago = chrono::Utc::now().signed_duration_since(ts);
+            if ago.num_days() > 0 {
+                format!("{}d ago", ago.num_days())
+            } else if ago.num_hours() > 0 {
+                format!("{}h ago", ago.num_hours())
+            } else if ago.num_minutes() > 0 {
+                format!("{}m ago", ago.num_minutes())
+            } else {
+                "just now".to_string()
+            }
+        } else {
+            String::new()
+        };
+
+        // Resource ID from attributes
+        let resource_id = parsed_entries[i]
+            .as_ref()
+            .and_then(|a| a.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        println!(
+            "  {} {} {}",
+            entry.captured_at.dimmed(),
+            action_display,
+            format!("({})", relative).dimmed()
+        );
+
+        if !resource_id.is_empty() {
+            println!("    id: {}", resource_id.dimmed());
+        }
+
+        if let Some(ref attrs) = parsed_entries[i] {
+            // Show key attributes based on what's present
+            for key in &[
+                "instance_type",
+                "cidr_block",
+                "desired_size",
+                "max_size",
+                "min_size",
+                "size",
+                "disk_size",
+                "engine",
+                "engine_version",
+            ] {
+                if let Some(val) = attrs.get(*key) {
+                    if !val.is_null() {
+                        let val_str = match val {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        println!("    {}: {}", key, val_str.dimmed());
+                    }
+                }
+            }
+
+            // Show tags
+            if let Some(tags) = attrs.get("tags") {
+                if !tags.is_null() && tags != &serde_json::json!({}) {
+                    println!(
+                        "    tags: {}",
+                        serde_json::to_string(tags).unwrap_or_default().dimmed()
+                    );
+                }
+            }
+
+            // Diff against previous entry (next in array since sorted DESC)
+            if let Some(Some(ref prev_attrs)) = parsed_entries.get(i + 1) {
+                let mut changes: Vec<String> = Vec::new();
+
+                // Diff tags specifically
+                let curr_tags = attrs.get("tags").cloned().unwrap_or(serde_json::json!({}));
+                let prev_tags = prev_attrs
+                    .get("tags")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                if let (Some(curr_map), Some(prev_map)) =
+                    (curr_tags.as_object(), prev_tags.as_object())
+                {
+                    for (k, v) in curr_map {
+                        match prev_map.get(k) {
+                            None => changes.push(format!(
+                                "{}",
+                                format!("+ tag \"{}\" = \"{}\"", k, v.as_str().unwrap_or(""))
+                                    .green()
+                            )),
+                            Some(prev_v) if prev_v != v => changes.push(format!(
+                                "{}",
+                                format!(
+                                    "~ tag \"{}\" = \"{}\" → \"{}\"",
+                                    k,
+                                    prev_v.as_str().unwrap_or(""),
+                                    v.as_str().unwrap_or("")
+                                )
+                                .yellow()
+                            )),
+                            _ => {}
+                        }
+                    }
+                    for k in prev_map.keys() {
+                        if !curr_map.contains_key(k) {
+                            changes.push(format!(
+                                "{}",
+                                format!(
+                                    "- tag \"{}\" = \"{}\"",
+                                    k,
+                                    prev_map[k].as_str().unwrap_or("")
+                                )
+                                .red()
+                            ));
+                        }
+                    }
+                }
+
+                // Diff key scalar attributes
+                for key in &[
+                    "instance_type",
+                    "cidr_block",
+                    "desired_size",
+                    "max_size",
+                    "min_size",
+                    "size",
+                    "disk_size",
+                ] {
+                    let curr_val = attrs.get(*key);
+                    let prev_val = prev_attrs.get(*key);
+                    if curr_val != prev_val {
+                        if let (Some(c), Some(p)) = (curr_val, prev_val) {
+                            if !c.is_null() || !p.is_null() {
+                                changes.push(format!(
+                                    "{}",
+                                    format!("~ {} = {} → {}", key, p, c).yellow()
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                if !changes.is_empty() {
+                    println!("    {}", "changes:".dimmed());
+                    for change in &changes {
+                        println!("      {}", change);
+                    }
+                }
+            }
+        }
+        println!();
+    }
+
+    println!();
+    println!(
+        "  {} entries shown (use {} for more)",
+        entries.len(),
+        "-n 50".cyan()
+    );
+    println!();
 
     Ok(())
 }

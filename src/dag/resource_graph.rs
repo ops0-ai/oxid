@@ -115,8 +115,9 @@ pub fn build_resource_dag(
                     .push(idx);
             }
         } else if let Some(keys) = evaluate_for_each(resource, var_defaults)? {
-            for (key, _value) in &keys {
+            for (key, value) in &keys {
                 let address = format!("{}[\"{}\"]", base_address, key);
+                let value_json = serde_json::to_string(value).unwrap_or_default();
                 let node = DagNode::Resource {
                     address: address.clone(),
                     base_address: base_address.clone(),
@@ -124,7 +125,7 @@ pub fn build_resource_dag(
                     name: resource.name.clone(),
                     provider_source: provider_source.clone(),
                     config: resource.clone(),
-                    index: Some(ResourceIndex::ForEach(key.clone())),
+                    index: Some(ResourceIndex::ForEach(key.clone(), value_json)),
                 };
                 let idx = graph.add_node(node);
                 node_map.insert(address, idx);

@@ -484,7 +484,8 @@ pub struct ResourceAddress {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResourceIndex {
     Count(usize),
-    ForEach(String),
+    /// ForEach(key, value_json) — key is the map key, value_json is the serialized value.
+    ForEach(String, String),
 }
 
 impl ResourceAddress {
@@ -511,7 +512,7 @@ impl ResourceAddress {
         let base = parts.join(".");
         match &self.index {
             Some(ResourceIndex::Count(i)) => format!("{}[{}]", base, i),
-            Some(ResourceIndex::ForEach(k)) => format!("{}[\"{}\"]", base, k),
+            Some(ResourceIndex::ForEach(k, _)) => format!("{}[\"{}\"]", base, k),
             None => base,
         }
     }
@@ -533,7 +534,7 @@ impl ResourceAddress {
         let (main_part, index) = if let Some(bracket_pos) = remaining.find('[') {
             let idx_str = &remaining[bracket_pos + 1..remaining.len() - 1];
             let index = if idx_str.starts_with('"') {
-                ResourceIndex::ForEach(idx_str.trim_matches('"').to_string())
+                ResourceIndex::ForEach(idx_str.trim_matches('"').to_string(), String::new())
             } else {
                 ResourceIndex::Count(idx_str.parse().ok()?)
             };

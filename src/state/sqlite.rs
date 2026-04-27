@@ -590,6 +590,57 @@ impl StateBackend for SqliteBackend {
         Ok(rows)
     }
 
+    // ─── Resource History ────────────────────────────────────────────────────
+
+    async fn record_resource_history(
+        &self,
+        workspace_id: &str,
+        address: &str,
+        action: &str,
+        attributes_json: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<()> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO resource_history (id, workspace_id, address, action, attributes_json, run_id, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, workspace_id, address, action, attributes_json, run_id, now],
+        )?;
+        Ok(())
+    }
+
+    async fn get_resource_history(
+        &self,
+        workspace_id: &str,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<super::models::ResourceHistory>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, address, action, attributes_json, run_id, captured_at
+             FROM resource_history
+             WHERE workspace_id = ?1 AND address = ?2
+             ORDER BY captured_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![workspace_id, address, limit], |row| {
+                Ok(super::models::ResourceHistory {
+                    id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    address: row.get(2)?,
+                    action: row.get(3)?,
+                    attributes_json: row.get(4)?,
+                    run_id: row.get(5)?,
+                    captured_at: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     // ─── Query ──────────────────────────────────────────────────────────────
 
     async fn query_raw(&self, sql: &str) -> Result<Vec<serde_json::Value>> {

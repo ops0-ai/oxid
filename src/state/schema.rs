@@ -119,6 +119,18 @@ CREATE TABLE IF NOT EXISTS run_resources (
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
 
+-- Resource change history (audit log of every resource change over time)
+CREATE TABLE IF NOT EXISTS resource_history (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    address TEXT NOT NULL,
+    action TEXT NOT NULL,
+    attributes_json TEXT,
+    run_id TEXT,
+    captured_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+
 -- Module-level state (retained for YAML module orchestration compatibility)
 CREATE TABLE IF NOT EXISTS modules (
     id TEXT PRIMARY KEY,
@@ -146,4 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_outputs_workspace ON resource_outputs(workspace_i
 CREATE INDEX IF NOT EXISTS idx_runs_workspace ON runs(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_run_resources_run ON run_resources(run_id);
 CREATE INDEX IF NOT EXISTS idx_modules_workspace ON modules(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_resource_history_address ON resource_history(address);
+CREATE INDEX IF NOT EXISTS idx_resource_history_workspace ON resource_history(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_resource_history_captured ON resource_history(captured_at);
+CREATE INDEX IF NOT EXISTS idx_resource_history_addr_time ON resource_history(address, captured_at);
 ";

@@ -727,6 +727,71 @@ impl StateBackend for PostgresBackend {
         Ok(rows.iter().map(run_from_row).collect())
     }
 
+    // ─── Resource History ────────────────────────────────────────────────────
+
+    async fn record_resource_history(
+        &self,
+        workspace_id: &str,
+        address: &str,
+        action: &str,
+        attributes_json: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<()> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Self::now_dt();
+        let attrs = attributes_json.map(parse_json);
+        sqlx::query(
+            "INSERT INTO resource_history (id, workspace_id, address, action, attributes_json, run_id, captured_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&id)
+        .bind(workspace_id)
+        .bind(address)
+        .bind(action)
+        .bind(attrs)
+        .bind(run_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_resource_history(
+        &self,
+        workspace_id: &str,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<super::models::ResourceHistory>> {
+        let rows = sqlx::query(
+            "SELECT id, workspace_id, address, action, attributes_json::text, run_id, captured_at
+             FROM resource_history
+             WHERE workspace_id = $1 AND address = $2
+             ORDER BY captured_at DESC
+             LIMIT $3",
+        )
+        .bind(workspace_id)
+        .bind(address)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let captured: DateTime<Utc> = r.get("captured_at");
+                super::models::ResourceHistory {
+                    id: r.get("id"),
+                    workspace_id: r.get("workspace_id"),
+                    address: r.get("address"),
+                    action: r.get("action"),
+                    attributes_json: r.get("attributes_json"),
+                    run_id: r.get("run_id"),
+                    captured_at: captured.to_rfc3339(),
+                }
+            })
+            .collect())
+    }
+
     // ─── Query ──────────────────────────────────────────────────────────────
 
     async fn query_raw(&self, sql: &str) -> Result<Vec<serde_json::Value>> {

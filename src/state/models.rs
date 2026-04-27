@@ -189,6 +189,18 @@ pub struct SyncResult {
     pub removed: usize,
 }
 
+/// A snapshot of a resource change for audit history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceHistory {
+    pub id: String,
+    pub workspace_id: String,
+    pub address: String,
+    pub action: String,
+    pub attributes_json: Option<String>,
+    pub run_id: Option<String>,
+    pub captured_at: String,
+}
+
 // ─── Legacy types (kept for backward compatibility) ─────────────────────────
 
 #[derive(Debug, Clone)]

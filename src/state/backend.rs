@@ -2,8 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::models::{
-    ImportResult, Lock, LockInfo, OutputValue, ResourceFilter, ResourceResult, ResourceState,
-    RunRecord, SyncResult, Workspace,
+    ImportResult, Lock, LockInfo, OutputValue, ResourceFilter, ResourceHistory, ResourceResult,
+    ResourceState, RunRecord, SyncResult, Workspace,
 };
 
 /// Pluggable state backend trait.
@@ -145,6 +145,26 @@ pub trait StateBackend: Send + Sync {
 
     /// List recent runs for a workspace.
     async fn list_runs(&self, workspace_id: &str, limit: usize) -> Result<Vec<RunRecord>>;
+
+    // ─── Resource History ────────────────────────────────────────────────────
+
+    /// Record a resource change snapshot.
+    async fn record_resource_history(
+        &self,
+        workspace_id: &str,
+        address: &str,
+        action: &str,
+        attributes_json: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<()>;
+
+    /// Get change history for a resource.
+    async fn get_resource_history(
+        &self,
+        workspace_id: &str,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<ResourceHistory>>;
 
     // ─── Query ──────────────────────────────────────────────────────────────
 

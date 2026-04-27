@@ -71,11 +71,23 @@ impl DagWalker {
     }
 
     /// Walk the DAG, executing nodes via the provided executor function.
+    /// If `changed_addresses` is provided, only those resources will show progress output.
     pub async fn walk(
         &self,
         graph: &ResourceGraph,
         executor: Arc<NodeExecutor>,
         mode: WalkMode,
+    ) -> Result<Vec<NodeResult>> {
+        self.walk_with_filter(graph, executor, mode, None).await
+    }
+
+    /// Walk the DAG with an optional filter for progress display.
+    pub async fn walk_with_filter(
+        &self,
+        graph: &ResourceGraph,
+        executor: Arc<NodeExecutor>,
+        mode: WalkMode,
+        changed_addresses: Option<Arc<std::collections::HashMap<String, String>>>,
     ) -> Result<Vec<NodeResult>> {
         let node_count = graph.node_count();
         if node_count == 0 {
@@ -173,6 +185,7 @@ impl DagWalker {
                 &start_times,
                 &running_info,
                 &wall_clock,
+                &changed_addresses,
             );
         }
 
@@ -209,8 +222,8 @@ impl DagWalker {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
 
-                    // User-facing progress (skip outputs)
-                    if !is_output {
+                    // User-facing progress (skip outputs and unchanged resources)
+                    if !is_output && node_info.is_some() {
                         match &result.status {
                             NodeStatus::Succeeded => {
                                 let verb_past = node_info
@@ -279,6 +292,7 @@ impl DagWalker {
                                         &start_times,
                                         &running_info,
                                         &wall_clock,
+                                        &changed_addresses,
                                     );
                                 }
                             }
@@ -339,6 +353,7 @@ fn spawn_node(
     start_times: &Arc<DashMap<NodeIndex, Instant>>,
     running_info: &Arc<DashMap<NodeIndex, RunningNode>>,
     _wall_clock: &Arc<Instant>,
+    changed_addresses: &Option<Arc<std::collections::HashMap<String, String>>>,
 ) {
     let node = graph[idx].clone();
     let address = node.address().to_string();
@@ -352,12 +367,30 @@ fn spawn_node(
     statuses.insert(idx, NodeStatus::Running);
     start_times.insert(idx, Instant::now());
 
-    // Show progress for resources only (not outputs)
-    if !is_output {
+    // Only show progress for resources that have actual changes
+    let show_progress = if let Some(ref changed) = changed_addresses {
+        changed.contains_key(&address) || is_data
+    } else {
+        true // No filter = show everything (plan mode, destroy mode)
+    };
+
+    // Show progress for resources only (not outputs, not unchanged)
+    if !is_output && show_progress {
+        // Use the planned action to determine the verb
+        let action = changed_addresses
+            .as_ref()
+            .and_then(|m| m.get(&address))
+            .map(|s| s.as_str());
+
         let (verb_progress, verb_past) = match mode {
             WalkMode::Destroy => ("Destroying", "Destruction"),
             WalkMode::Apply if is_data => ("Reading", "Read"),
-            WalkMode::Apply => ("Creating", "Creation"),
+            WalkMode::Apply => match action {
+                Some("~") => ("Updating", "Update"),
+                Some("-") => ("Destroying", "Destruction"),
+                Some("-/+") => ("Replacing", "Replacement"),
+                _ => ("Creating", "Creation"),
+            },
         };
 
         println!("{}: {}...", address, verb_progress.cyan());

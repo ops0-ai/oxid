@@ -304,9 +304,12 @@ impl ResourceEngine {
                         Some(crate::config::types::ResourceIndex::Count(i)) => {
                             eval_ctx.count_index = Some(*i)
                         }
-                        Some(crate::config::types::ResourceIndex::ForEach(k)) => {
+                        Some(crate::config::types::ResourceIndex::ForEach(k, v)) => {
                             eval_ctx.each_key = Some(k.clone());
-                            eval_ctx.each_value = Some(serde_json::Value::String(k.clone()));
+                            eval_ctx.each_value = Some(
+                                serde_json::from_str(v)
+                                    .unwrap_or(serde_json::Value::String(k.clone())),
+                            );
                         }
                         None => {}
                     }
@@ -479,9 +482,12 @@ impl ResourceEngine {
                         Some(crate::config::types::ResourceIndex::Count(i)) => {
                             ds_eval_ctx.count_index = Some(*i);
                         }
-                        Some(crate::config::types::ResourceIndex::ForEach(k)) => {
+                        Some(crate::config::types::ResourceIndex::ForEach(k, v)) => {
                             ds_eval_ctx.each_key = Some(k.clone());
-                            ds_eval_ctx.each_value = Some(serde_json::Value::String(k.clone()));
+                            ds_eval_ctx.each_value = Some(
+                                serde_json::from_str(v)
+                                    .unwrap_or(serde_json::Value::String(k.clone())),
+                            );
                         }
                         None => {}
                     }
@@ -615,13 +621,17 @@ impl ResourceEngine {
         // resolve references like `aws_s3_bucket.public_scripts.id`.
         let resource_states: Arc<DashMap<String, serde_json::Value>> = Arc::new(DashMap::new());
 
-        // Build a map of planned changes for the executor to reference
-        let _planned_changes: Arc<HashMap<String, &PlannedChange>> = Arc::new(
+        // Build a map of addresses that have actual changes (non-NoOp) with their action
+        let changed_addresses: Arc<std::collections::HashMap<String, String>> = Arc::new(
             plan.changes
                 .iter()
-                .map(|c| (c.address.clone(), c))
+                .filter(|c| c.action != ResourceAction::NoOp)
+                .map(|c| (c.address.clone(), format!("{}", c.action)))
                 .collect(),
         );
+
+        // Clone for the walker (closure captures the original)
+        let changed_for_walker = Arc::clone(&changed_addresses);
 
         // Create the node executor closure
         let executor: NodeExecutor = Box::new(move |_idx: NodeIndex, node: DagNode| {
@@ -630,6 +640,7 @@ impl ResourceEngine {
             let backend = Arc::clone(&backend_clone);
             let resource_states = Arc::clone(&resource_states);
             let var_defaults = var_defaults.clone();
+            let changed_addresses = Arc::clone(&changed_addresses);
 
             Box::pin(async move {
                 match node {
@@ -649,12 +660,27 @@ impl ResourceEngine {
                             Some(crate::config::types::ResourceIndex::Count(i)) => {
                                 eval_ctx.count_index = Some(*i);
                             }
-                            Some(crate::config::types::ResourceIndex::ForEach(k)) => {
+                            Some(crate::config::types::ResourceIndex::ForEach(k, v)) => {
                                 eval_ctx.each_key = Some(k.clone());
-                                eval_ctx.each_value = Some(serde_json::Value::String(k.clone()));
+                                eval_ctx.each_value = Some(
+                                    serde_json::from_str(v)
+                                        .unwrap_or(serde_json::Value::String(k.clone())),
+                                );
                             }
                             None => {}
                         }
+                        // Skip unchanged resources — just load their state for dependents
+                        if !changed_addresses.contains_key(address) {
+                            if let Some(existing) = backend.get_resource(&ws_id, address).await? {
+                                let state: serde_json::Value =
+                                    serde_json::from_str(&existing.attributes_json)?;
+                                resource_states.insert(address.clone(), state.clone());
+                                return Ok(Some(state));
+                            }
+                            // Resource not in state yet (new) but also not in plan — skip
+                            return Ok(None);
+                        }
+
                         let user_config = attributes_to_json(&config.attributes, &eval_ctx);
 
                         // Build full config with all schema attributes for msgpack encoding
@@ -744,6 +770,17 @@ impl ResourceEngine {
 
                                 info!(address = %address, "Old resource destroyed");
 
+                                // Record replacement in history
+                                let _ = backend
+                                    .record_resource_history(
+                                        &ws_id,
+                                        address,
+                                        "replace-destroy",
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+
                                 // Remove from state database
                                 backend.delete_resource(&ws_id, address).await.ok();
 
@@ -800,13 +837,29 @@ impl ResourceEngine {
                                 Some(crate::config::types::ResourceIndex::Count(i)) => {
                                     Some(i.to_string())
                                 }
-                                Some(crate::config::types::ResourceIndex::ForEach(k)) => {
+                                Some(crate::config::types::ResourceIndex::ForEach(k, _)) => {
                                     Some(k.clone())
                                 }
                                 None => None,
                             };
 
                             backend.upsert_resource(&resource_state).await?;
+
+                            // Record change in history
+                            let action = if prior_state.is_some() {
+                                "update"
+                            } else {
+                                "create"
+                            };
+                            let _ = backend
+                                .record_resource_history(
+                                    &ws_id,
+                                    address,
+                                    action,
+                                    Some(&resource_state.attributes_json),
+                                    None,
+                                )
+                                .await;
 
                             info!(address = %address, "Resource applied successfully");
                         }
@@ -829,9 +882,12 @@ impl ResourceEngine {
                             Some(crate::config::types::ResourceIndex::Count(i)) => {
                                 eval_ctx.count_index = Some(*i);
                             }
-                            Some(crate::config::types::ResourceIndex::ForEach(k)) => {
+                            Some(crate::config::types::ResourceIndex::ForEach(k, v)) => {
                                 eval_ctx.each_key = Some(k.clone());
-                                eval_ctx.each_value = Some(serde_json::Value::String(k.clone()));
+                                eval_ctx.each_value = Some(
+                                    serde_json::from_str(v)
+                                        .unwrap_or(serde_json::Value::String(k.clone())),
+                                );
                             }
                             None => {}
                         }
@@ -865,10 +921,11 @@ impl ResourceEngine {
         let walker = DagWalker::new(self.parallelism);
         let start = std::time::Instant::now();
         let results = walker
-            .walk(
+            .walk_with_filter(
                 &graph,
                 Arc::new(executor),
                 crate::dag::walker::WalkMode::Apply,
+                Some(changed_for_walker),
             )
             .await?;
         let elapsed_secs = start.elapsed().as_secs();
@@ -958,9 +1015,12 @@ impl ResourceEngine {
                             Some(crate::config::types::ResourceIndex::Count(i)) => {
                                 eval_ctx.count_index = Some(*i);
                             }
-                            Some(crate::config::types::ResourceIndex::ForEach(k)) => {
+                            Some(crate::config::types::ResourceIndex::ForEach(k, v)) => {
                                 eval_ctx.each_key = Some(k.clone());
-                                eval_ctx.each_value = Some(serde_json::Value::String(k.clone()));
+                                eval_ctx.each_value = Some(
+                                    serde_json::from_str(v)
+                                        .unwrap_or(serde_json::Value::String(k.clone())),
+                                );
                             }
                             None => {}
                         }
@@ -1025,6 +1085,12 @@ impl ResourceEngine {
 
                         // Remove from state
                         backend.delete_resource(&ws_id, address).await?;
+
+                        // Record deletion in history
+                        let _ = backend
+                            .record_resource_history(&ws_id, address, "delete", None, None)
+                            .await;
+
                         info!(address = %address, "Resource destroyed");
 
                         // Return the prior state's ID so the walker can display it
@@ -2672,7 +2738,7 @@ fn resource_index_to_json(
         Some(crate::config::types::ResourceIndex::Count(i)) => {
             Some(serde_json::Value::Number((*i).into()))
         }
-        Some(crate::config::types::ResourceIndex::ForEach(k)) => {
+        Some(crate::config::types::ResourceIndex::ForEach(k, _)) => {
             Some(serde_json::Value::String(k.clone()))
         }
         None => None,
