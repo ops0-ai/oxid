@@ -1117,9 +1117,14 @@ impl ResourceEngine {
             .await?;
         let elapsed_secs = start.elapsed().as_secs();
 
+        // Count only actual resources (not outputs or data sources)
         let destroyed = results
             .iter()
-            .filter(|r| r.status == NodeStatus::Succeeded)
+            .filter(|r| {
+                r.status == NodeStatus::Succeeded
+                    && r.address.contains('.')
+                    && !r.address.starts_with("data.")
+            })
             .count();
         let failed = results
             .iter()
