@@ -801,7 +801,8 @@ impl StateBackend for SqliteBackend {
         let updated = 0usize;
         let now = Self::now();
         let mut seen_addresses = Vec::new();
-        let mut history_entries: Vec<(String, String)> = Vec::new();
+        // (address, attrs_str, action)
+        let mut history_entries: Vec<(String, String, String)> = Vec::new();
 
         {
             let conn = self.conn.lock().unwrap();
@@ -823,9 +824,25 @@ impl StateBackend for SqliteBackend {
                     };
                     seen_addresses.push(address.clone());
 
-                    let id = uuid::Uuid::new_v4().to_string();
                     let attrs_json = serde_json::to_string(&instance.attributes)
                         .unwrap_or_else(|_| "{}".to_string());
+
+                    // Check existing state to determine action
+                    let existing_attrs: Option<String> = conn
+                        .query_row(
+                            "SELECT attributes_json FROM resources WHERE workspace_id = ?1 AND address = ?2",
+                            params![workspace_id, address],
+                            |row| row.get(0),
+                        )
+                        .ok();
+
+                    let action = match &existing_attrs {
+                        None => Some("create"),
+                        Some(old) if *old != attrs_json => Some("update"),
+                        _ => None, // no change
+                    };
+
+                    let id = uuid::Uuid::new_v4().to_string();
                     let sensitive_json = serde_json::to_string(&instance.sensitive_attributes)
                         .unwrap_or_else(|_| "[]".to_string());
 
@@ -861,10 +878,14 @@ impl StateBackend for SqliteBackend {
 
                     match result {
                         Ok(_) => {
-                            added += 1;
-                            let attrs_str =
-                                serde_json::to_string(&instance.attributes).unwrap_or_default();
-                            history_entries.push((address.clone(), attrs_str));
+                            if let Some(act) = action {
+                                added += 1;
+                                history_entries.push((
+                                    address.clone(),
+                                    attrs_json.clone(),
+                                    act.to_string(),
+                                ));
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("Failed to sync {}: {}", address, e);
@@ -889,9 +910,9 @@ impl StateBackend for SqliteBackend {
         } // drop conn before await
 
         // Record history entries (after conn is dropped)
-        for (address, attrs_str) in &history_entries {
+        for (address, attrs_str, action) in &history_entries {
             let _ = self
-                .record_resource_history(workspace_id, address, "sync", Some(attrs_str), None)
+                .record_resource_history(workspace_id, address, action, Some(attrs_str), None)
                 .await;
         }
 
@@ -906,6 +927,9 @@ impl StateBackend for SqliteBackend {
         for res in &existing {
             if !seen_addresses.contains(&res.address) {
                 let _ = self.delete_resource(workspace_id, &res.address).await;
+                let _ = self
+                    .record_resource_history(workspace_id, &res.address, "delete", None, None)
+                    .await;
                 removed += 1;
             }
         }

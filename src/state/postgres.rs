@@ -962,7 +962,7 @@ impl StateBackend for PostgresBackend {
             serde_json::from_str(state_json).context("Failed to parse .tfstate JSON")?;
 
         let mut added = 0usize;
-        let mut updated = 0usize;
+        let updated = 0usize;
         let now = Self::now_dt();
         let mut seen_addresses = Vec::new();
 
@@ -983,8 +983,28 @@ impl StateBackend for PostgresBackend {
                 };
                 seen_addresses.push(address.clone());
 
+                // Check existing state to determine action
+                let existing = self
+                    .get_resource(workspace_id, &address)
+                    .await
+                    .ok()
+                    .flatten();
+                let new_attrs = instance.attributes.clone();
+                let new_attrs_str = serde_json::to_string(&new_attrs).unwrap_or_default();
+
+                // Determine if this is a create, update, or no-op
+                let action = if let Some(ref existing_res) = existing {
+                    if existing_res.attributes_json == new_attrs_str {
+                        None // no change
+                    } else {
+                        Some("update")
+                    }
+                } else {
+                    Some("create")
+                };
+
                 let id = uuid::Uuid::new_v4().to_string();
-                let attrs: serde_json::Value = instance.attributes.clone();
+                let attrs: serde_json::Value = new_attrs;
                 let sensitive: serde_json::Value =
                     serde_json::to_value(&instance.sensitive_attributes)
                         .unwrap_or(serde_json::json!([]));
@@ -1020,22 +1040,20 @@ impl StateBackend for PostgresBackend {
                 .await;
 
                 match result {
-                    Ok(r) if r.rows_affected() > 0 => {
-                        added += 1;
-                        // Record in history
-                        let attrs_str =
-                            serde_json::to_string(&instance.attributes).unwrap_or_default();
-                        let _ = self
-                            .record_resource_history(
-                                workspace_id,
-                                &address,
-                                "sync",
-                                Some(&attrs_str),
-                                None,
-                            )
-                            .await;
+                    Ok(_) => {
+                        if let Some(act) = action {
+                            added += 1;
+                            let _ = self
+                                .record_resource_history(
+                                    workspace_id,
+                                    &address,
+                                    act,
+                                    Some(&new_attrs_str),
+                                    None,
+                                )
+                                .await;
+                        }
                     }
-                    Ok(_) => updated += 1,
                     Err(e) => {
                         tracing::warn!("Failed to sync {}: {}", address, e);
                     }
@@ -1080,6 +1098,9 @@ impl StateBackend for PostgresBackend {
         for res in &existing {
             if !seen_addresses.contains(&res.address) {
                 let _ = self.delete_resource(workspace_id, &res.address).await;
+                let _ = self
+                    .record_resource_history(workspace_id, &res.address, "delete", None, None)
+                    .await;
                 removed += 1;
             }
         }
