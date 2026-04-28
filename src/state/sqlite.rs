@@ -693,82 +693,97 @@ impl StateBackend for SqliteBackend {
         let mut warnings = Vec::new();
         let now = Self::now();
 
-        let conn = self.conn.lock().unwrap();
+        // Collect history entries to write after releasing conn lock
+        let mut history_entries: Vec<(String, String)> = Vec::new();
 
-        for tf_resource in &state.resources {
-            for (idx, instance) in tf_resource.instances.iter().enumerate() {
-                let address = if let Some(ref key) = instance.index_key {
-                    // count or for_each resource — always include index
-                    format!(
-                        "{}.{}[{}]",
-                        tf_resource.resource_type, tf_resource.name, key
-                    )
-                } else if tf_resource.instances.len() > 1 {
-                    // Multiple instances without explicit index_key — use positional index
-                    format!(
-                        "{}.{}[{}]",
-                        tf_resource.resource_type, tf_resource.name, idx
-                    )
-                } else {
-                    format!("{}.{}", tf_resource.resource_type, tf_resource.name)
-                };
+        {
+            let conn = self.conn.lock().unwrap();
 
-                let id = uuid::Uuid::new_v4().to_string();
-                let attrs_json = serde_json::to_string(&instance.attributes)
-                    .unwrap_or_else(|_| "{}".to_string());
-                let sensitive_json = serde_json::to_string(&instance.sensitive_attributes)
-                    .unwrap_or_else(|_| "[]".to_string());
+            for tf_resource in &state.resources {
+                for (idx, instance) in tf_resource.instances.iter().enumerate() {
+                    let address = if let Some(ref key) = instance.index_key {
+                        format!(
+                            "{}.{}[{}]",
+                            tf_resource.resource_type, tf_resource.name, key
+                        )
+                    } else if tf_resource.instances.len() > 1 {
+                        format!(
+                            "{}.{}[{}]",
+                            tf_resource.resource_type, tf_resource.name, idx
+                        )
+                    } else {
+                        format!("{}.{}", tf_resource.resource_type, tf_resource.name)
+                    };
 
-                let result = conn.execute(
-                    "INSERT INTO resources (id, workspace_id, module_path, resource_type, resource_name,
-                        resource_mode, provider_source, index_key, address, status,
-                        attributes_json, sensitive_attrs, schema_version, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                     ON CONFLICT(workspace_id, address) DO NOTHING",
-                    params![
-                        id,
-                        workspace_id,
-                        "",  // module_path - would need to be extracted from resource
-                        tf_resource.resource_type,
-                        tf_resource.name,
-                        tf_resource.mode,
-                        tf_resource.provider,
-                        instance.index_key,
-                        address,
-                        "created",
-                        attrs_json,
-                        sensitive_json,
-                        instance.schema_version.unwrap_or(0),
-                        now,
-                        now,
-                    ],
-                );
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let attrs_json = serde_json::to_string(&instance.attributes)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let sensitive_json = serde_json::to_string(&instance.sensitive_attributes)
+                        .unwrap_or_else(|_| "[]".to_string());
 
-                match result {
-                    Ok(rows) if rows > 0 => imported += 1,
-                    Ok(_) => {
-                        skipped += 1;
-                        warnings.push(format!("Skipped {} (already exists)", address));
-                    }
-                    Err(e) => {
-                        skipped += 1;
-                        warnings.push(format!("Failed to import {}: {}", address, e));
+                    let result = conn.execute(
+                        "INSERT INTO resources (id, workspace_id, module_path, resource_type, resource_name,
+                            resource_mode, provider_source, index_key, address, status,
+                            attributes_json, sensitive_attrs, schema_version, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                         ON CONFLICT(workspace_id, address) DO NOTHING",
+                        params![
+                            id,
+                            workspace_id,
+                            "",
+                            tf_resource.resource_type,
+                            tf_resource.name,
+                            tf_resource.mode,
+                            tf_resource.provider,
+                            instance.index_key,
+                            address,
+                            "created",
+                            attrs_json,
+                            sensitive_json,
+                            instance.schema_version.unwrap_or(0),
+                            now,
+                            now,
+                        ],
+                    );
+
+                    match result {
+                        Ok(rows) if rows > 0 => {
+                            imported += 1;
+                            let attrs_str =
+                                serde_json::to_string(&instance.attributes).unwrap_or_default();
+                            history_entries.push((address.clone(), attrs_str));
+                        }
+                        Ok(_) => {
+                            skipped += 1;
+                            warnings.push(format!("Skipped {} (already exists)", address));
+                        }
+                        Err(e) => {
+                            skipped += 1;
+                            warnings.push(format!("Failed to import {}: {}", address, e));
+                        }
                     }
                 }
             }
-        }
 
-        // Import outputs
-        for (name, output) in &state.outputs {
-            let id = uuid::Uuid::new_v4().to_string();
-            let value_str = serde_json::to_string(&output.value).unwrap_or_default();
-            let _ = conn.execute(
-                "INSERT INTO resource_outputs (id, workspace_id, module_path, output_name, output_value, sensitive)
-                 VALUES (?1, ?2, '', ?3, ?4, ?5)
-                 ON CONFLICT(workspace_id, module_path, output_name) DO UPDATE SET
-                    output_value = excluded.output_value",
-                params![id, workspace_id, name, value_str, output.sensitive.unwrap_or(false) as i32],
-            );
+            // Import outputs
+            for (name, output) in &state.outputs {
+                let id = uuid::Uuid::new_v4().to_string();
+                let value_str = serde_json::to_string(&output.value).unwrap_or_default();
+                let _ = conn.execute(
+                    "INSERT INTO resource_outputs (id, workspace_id, module_path, output_name, output_value, sensitive)
+                     VALUES (?1, ?2, '', ?3, ?4, ?5)
+                     ON CONFLICT(workspace_id, module_path, output_name) DO UPDATE SET
+                        output_value = excluded.output_value",
+                    params![id, workspace_id, name, value_str, output.sensitive.unwrap_or(false) as i32],
+                );
+            }
+        } // drop conn lock
+
+        // Record history entries (after conn is dropped)
+        for (address, attrs_str) in &history_entries {
+            let _ = self
+                .record_resource_history(workspace_id, address, "import", Some(attrs_str), None)
+                .await;
         }
 
         Ok(ImportResult {
@@ -786,6 +801,7 @@ impl StateBackend for SqliteBackend {
         let updated = 0usize;
         let now = Self::now();
         let mut seen_addresses = Vec::new();
+        let mut history_entries: Vec<(String, String)> = Vec::new();
 
         {
             let conn = self.conn.lock().unwrap();
@@ -844,7 +860,12 @@ impl StateBackend for SqliteBackend {
                 );
 
                     match result {
-                        Ok(_) => added += 1,
+                        Ok(_) => {
+                            added += 1;
+                            let attrs_str =
+                                serde_json::to_string(&instance.attributes).unwrap_or_default();
+                            history_entries.push((address.clone(), attrs_str));
+                        }
                         Err(e) => {
                             tracing::warn!("Failed to sync {}: {}", address, e);
                         }
@@ -866,6 +887,13 @@ impl StateBackend for SqliteBackend {
             );
             }
         } // drop conn before await
+
+        // Record history entries (after conn is dropped)
+        for (address, attrs_str) in &history_entries {
+            let _ = self
+                .record_resource_history(workspace_id, address, "sync", Some(attrs_str), None)
+                .await;
+        }
 
         // Remove resources no longer in the state file
         let existing = self

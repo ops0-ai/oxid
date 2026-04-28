@@ -899,7 +899,20 @@ impl StateBackend for PostgresBackend {
                 .await;
 
                 match result {
-                    Ok(r) if r.rows_affected() > 0 => imported += 1,
+                    Ok(r) if r.rows_affected() > 0 => {
+                        imported += 1;
+                        let attrs_str =
+                            serde_json::to_string(&instance.attributes).unwrap_or_default();
+                        let _ = self
+                            .record_resource_history(
+                                workspace_id,
+                                &address,
+                                "import",
+                                Some(&attrs_str),
+                                None,
+                            )
+                            .await;
+                    }
                     Ok(_) => {
                         skipped += 1;
                         warnings.push(format!("Skipped {} (already exists)", address));
@@ -1008,9 +1021,19 @@ impl StateBackend for PostgresBackend {
 
                 match result {
                     Ok(r) if r.rows_affected() > 0 => {
-                        // Check if it was an insert or update by checking created_at
-                        // For simplicity, count all as updated; new ones as added
                         added += 1;
+                        // Record in history
+                        let attrs_str =
+                            serde_json::to_string(&instance.attributes).unwrap_or_default();
+                        let _ = self
+                            .record_resource_history(
+                                workspace_id,
+                                &address,
+                                "sync",
+                                Some(&attrs_str),
+                                None,
+                            )
+                            .await;
                     }
                     Ok(_) => updated += 1,
                     Err(e) => {
