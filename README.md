@@ -1,292 +1,233 @@
-# Oxid
-
-> **Beta** — Oxid is under active development. It works end-to-end with real AWS providers, but has not been battle-tested in production yet. Use caution for production deployments and please report any issues you find. Community testing and contributions are very welcome!
-
-A standalone infrastructure-as-code engine. Open-source alternative to Terraform.
-
-Oxid parses `.tf` (HCL) and `.tf.json` files natively and communicates directly with Terraform providers via gRPC — no `terraform` or `tofu` binary required.
-
-## Why Oxid?
-
-| | Terraform/OpenTofu | Oxid |
-|---|---|---|
-| **Execution** | Wave-based (batch) | Event-driven per-resource |
-| **Parallelism** | Resources in same wave wait for slowest | Dependents start the instant their deps complete |
-| **State** | JSON file or remote backend | SQLite (local) / PostgreSQL (teams) |
-| **Config** | HCL + JSON | HCL + JSON + YAML |
-| **Provider protocol** | Wraps binary / shared lib | Direct gRPC (tfplugin5/6) |
-| **Queryable state** | `terraform show` | Full SQL: `oxid query "SELECT * FROM resources"` |
-| **License** | BSL / MPL | Apache-2.0 |
-
-## Features
-
-- Native HCL (.tf) and JSON (.tf.json) parsing — reads your existing Terraform configs
-- Mixed-format directories — `.tf` and `.tf.json` files in the same directory are merged automatically
-- Direct gRPC communication with all Terraform providers (AWS, GCP, Azure, etc.)
-- Event-driven DAG walker with per-resource parallelism
-- Real-time progress with elapsed time tracking
-- Resource-level plan display (Terraform-style `+`, `~`, `-`, `-/+`)
-- SQLite state backend with full SQL query support
-- .tfvars and TF_VAR_ environment variable support
-- PostgreSQL remote state backend with JSONB, TIMESTAMPTZ, GIN indexes
-- Drift detection with `oxid drift`
-- Import from existing .tfstate files (auto-detected on `oxid init`)
-- `--refresh=false` for fast plan using cached state
-
-## Quick Start
-
-### Install
-
-```bash
-# One-line install (Linux & macOS)
-curl -fsSL https://raw.githubusercontent.com/ops0-ai/oxid/main/install.sh | bash
-```
-
-Or download a specific release manually:
-
-```bash
-# macOS (Apple Silicon)
-curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-darwin-arm64.tar.gz | tar xz
-sudo mv oxid /usr/local/bin/
-
-# macOS (Intel)
-curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-darwin-amd64.tar.gz | tar xz
-sudo mv oxid /usr/local/bin/
-
-# Linux (x86_64)
-curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-linux-amd64.tar.gz | tar xz
-sudo mv oxid /usr/local/bin/
-
-# Linux (ARM64)
-curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-linux-arm64.tar.gz | tar xz
-sudo mv oxid /usr/local/bin/
-
-# Alpine / musl (x86_64)
-curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-linux-musl-amd64.tar.gz | tar xz
-sudo mv oxid /usr/local/bin/
-
-# Alpine / musl (ARM64)
-curl -fsSL https://github.com/ops0-ai/oxid/releases/latest/download/oxid-linux-musl-arm64.tar.gz | tar xz
-sudo mv oxid /usr/local/bin/
-```
-
-From source:
-
-```bash
-git clone https://github.com/ops0-ai/oxid.git
-cd oxid
-cargo build --release
-# Binary at ./target/release/oxid (includes SQLite + PostgreSQL + S3 import)
-```
-
-### Usage
-
-```bash
-# Initialize providers
-oxid init
-
-# Preview changes
-oxid plan
-
-# Apply infrastructure
-oxid apply
-
-# Destroy infrastructure
-oxid destroy
-
-# List resources in state
-oxid state list
-
-# Show resource details
-oxid state show aws_vpc.main
-
-# Query state with SQL
-oxid query "SELECT address, resource_type, status FROM resources"
-
-# Fast plan (skip cloud API refresh, use cached state)
-oxid plan --refresh=false
-
-# Detect drift
-oxid drift
-
-# Visualize dependency graph
-oxid graph | dot -Tpng -o graph.png
-```
-
-### Example
-
-Given standard Terraform files:
-
-```hcl
-# main.tf
-provider "aws" {
-  region = var.aws_region
-}
-
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  tags = {
-    Name = "my-vpc"
-    iac  = "oxid"
-  }
-}
-
-resource "aws_subnet" "public" {
-  vpc_id     = aws_vpc.main.id
-  cidr_block = "10.0.1.0/24"
-}
-```
-
-```bash
-$ oxid apply
-
-aws_vpc.main: Refreshing state... [1/2]
-aws_subnet.public: Refreshing state... [2/2]
-
-Oxid used the selected providers to generate the following execution plan.
-Resource actions are indicated with the following symbols:
-  + create
-
-Oxid will perform the following actions:
-
-  # aws_vpc.main will be created
-  + resource "aws_vpc" "main" {
-      + cidr_block           = "10.0.0.0/16"
-      + enable_dns_hostnames = true
-      + tags                 = { Name = "my-vpc", iac = "oxid" }
-    }
-
-  # aws_subnet.public will be created
-  + resource "aws_subnet" "public" {
-      + cidr_block = "10.0.1.0/24"
-      + vpc_id     = (known after apply)
-    }
-
-Plan: 2 to add.
-
-Do you want to perform these actions? Only 'yes' will be accepted.
-  Enter a value: yes
-
-aws_vpc.main: Creating...
-aws_vpc.main: Creation complete after 3s [1/2] [id=vpc-0abc123]
-aws_subnet.public: Creating...
-aws_subnet.public: Creation complete after 1s [2/2] [id=subnet-0def456]
-
-Apply complete! Resources: 2 added, 0 changed, 0 destroyed. Total time: 4s.
-```
-
-## How It Works
-
-1. **Parse** — Reads `.tf` (HCL) and `.tf.json` (JSON) files, extracts resources, data sources, variables, outputs, and providers. Mixed-format directories are merged.
-2. **Build DAG** — Constructs a dependency graph from explicit `depends_on` and implicit expression references
-3. **Start Providers** — Downloads provider binaries from registry.terraform.io, starts them as subprocesses, connects via gRPC
-4. **Plan** — Calls `PlanResourceChange` on each provider to compute diffs
-5. **Apply** — Event-driven DAG walker executes resources as dependencies are satisfied, calling `ApplyResourceChange` via gRPC
-6. **Store State** — Persists resource attributes to SQLite (local) or PostgreSQL (remote)
-
-## Architecture
-
-```
-               .tf / .tf.json files
-                        |
-              [HCL + JSON Parser]
-                        |
-                 [WorkspaceConfig]
-                        |
-                  [DAG Builder]
-                        |
-                [Resource Graph]
-                   /    |    \
-            [Provider] [Provider] [Provider]
-              gRPC       gRPC       gRPC
-               |          |          |
-            [AWS]      [GCP]     [Azure]
-                        |
-            [SQLite / PostgreSQL State]
-```
-
-## PostgreSQL Remote State
-
-By default, oxid stores state in a local SQLite database. For team collaboration, you can use PostgreSQL as a remote state backend.
-
-### Setup
-
-```bash
-# Set the database URL (supports Amazon RDS, Supabase, Neon, or any PostgreSQL)
-export OXID_DATABASE_URL="postgres://user:password@hostname:5432/dbname"
-
-# Initialize — tables are created automatically
-oxid init
-```
-
-When `OXID_DATABASE_URL` is set, oxid automatically uses PostgreSQL. When unset, it falls back to SQLite.
-
-### Schema
-
-The PostgreSQL backend uses native Postgres types for performance and queryability:
-
-| Column | Type | Purpose |
-|---|---|---|
-| `attributes_json` | `JSONB` | Resource attributes (GIN-indexed) |
-| `sensitive_attrs` | `JSONB` | Sensitive attribute keys (GIN-indexed) |
-| `created_at`, `updated_at` | `TIMESTAMPTZ` | Timestamps with timezone |
-| `sensitive` | `BOOLEAN` | Output sensitivity flag |
-
-### Querying
-
-JSONB enables powerful queries against your infrastructure state:
-
-```sql
--- Count resources by type
-oxid query "SELECT resource_type, COUNT(*) FROM resources GROUP BY resource_type"
-
--- Find all VPCs by CIDR
-oxid query "SELECT address, attributes_json->>'cidr_block' AS cidr FROM resources WHERE resource_type = 'aws_vpc'"
-
--- Find resources with a specific tag
-oxid query "SELECT address FROM resources WHERE attributes_json->'tags'->>'Environment' = 'production'"
-
--- Find all t3.micro instances
-oxid query "SELECT address FROM resources WHERE attributes_json @> '{\"instance_type\": \"t3.micro\"}'"
-```
-
-### Auto-Import from Terraform
-
-When you run `oxid init` in a directory with existing Terraform state, oxid automatically detects and imports it:
-
-```bash
-# Auto-detects local terraform.tfstate
-oxid init
-
-# Also detects remote S3 backends configured in your .tf files
-# and downloads + imports the state automatically
-```
-
-### TLS / RDS
-
-Connections to Amazon RDS and other TLS-requiring hosts work out of the box (built with `rustls`).
-
-## Building
-
-```bash
-# Prerequisites: Rust 1.75+, protoc (protobuf compiler)
-cargo build --release
-```
-
-## Contributing
-
-Oxid is in beta and help is appreciated! Here's how you can contribute:
-
-- **Test with your `.tf` / `.tf.json` configs** — Try `oxid plan` against your existing Terraform projects and report what works/breaks
-- **Report issues** — File bugs at [github.com/ops0-ai/oxid/issues](https://github.com/ops0-ai/oxid/issues)
-- **Provider coverage** — Test with different providers (GCP, Azure, Cloudflare, etc.) beyond AWS
-- **Code contributions** — PRs welcome. See the architecture section above for how things fit together
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE) for details.
+<p align="center">
+  <h1 align="center">Oxid</h1>
+  <p align="center">
+    <strong>Open-source infrastructure-as-code engine. Drop-in alternative to Terraform and OpenTofu.</strong>
+  </p>
+  <p align="center">
+    <a href="https://oxid.dev/docs">Documentation</a> |
+    <a href="https://oxid.dev/docs/quickstart">Quick Start</a> |
+    <a href="https://oxid.dev/docs/blast-radius">Blast Radius</a> |
+    <a href="https://oxid.dev/docs/history">Resource History</a> |
+    <a href="https://oxid.dev/docs/logging">Observability</a>
+  </p>
+  <p align="center">
+    <a href="https://github.com/ops0-ai/oxid/releases"><img src="https://img.shields.io/github/v/release/ops0-ai/oxid?style=flat-square&color=blue" alt="Release"></a>
+    <a href="https://github.com/ops0-ai/oxid/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green?style=flat-square" alt="License"></a>
+    <a href="https://github.com/ops0-ai/oxid/stargazers"><img src="https://img.shields.io/github/stars/ops0-ai/oxid?style=flat-square" alt="Stars"></a>
+  </p>
+</p>
 
 ---
 
-Built by [ops0.com](https://ops0.com)
+Oxid reads your existing `.tf` files, talks directly to AWS/GCP/Azure providers via gRPC, and stores state in SQLite or PostgreSQL. No Terraform or OpenTofu binary required.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ops0-ai/oxid/main/install.sh | bash
+```
+
+## Why Oxid?
+
+| | Terraform / OpenTofu | Oxid |
+|---|---|---|
+| Execution Model | Wave-based (batch) | Event-driven per-resource |
+| Parallelism | Resources in same wave wait for slowest | Dependents start instantly when deps complete |
+| State Backend | JSON file or remote backend | SQLite (local) / PostgreSQL (teams) |
+| Config Language | HCL only | HCL + YAML |
+| Provider Protocol | Wraps binary / shared lib | Direct gRPC (tfplugin5/6) |
+| Queryable State | `terraform show` | Full SQL queries |
+| Resource History | No built-in audit trail | Full change history with attribute diffs |
+| Blast Radius | No native support | Forward + reverse dependency analysis with depth levels |
+| Drift Detection | Manual plan comparison | Built-in `oxid drift` command |
+| Sensitive Output Encryption | Stored as plain text in state | AES-256 encrypted at rest (pgcrypto) |
+| Structured Logging | `TF_LOG` env var, unstructured text | JSON log file with resource IDs, actions, timing (Datadog/Splunk/OTel ready) |
+| Apply Efficiency | Re-evaluates all resources each apply | Smart apply - only touches changed resources, skips unchanged |
+| License | BSL / MPL | Apache-2.0 |
+
+## Get Started
+
+```bash
+cd your-terraform-project/
+oxid init       # download providers, import existing state
+oxid plan       # preview changes
+oxid apply      # apply infrastructure
+```
+
+Your existing `.tf` files, `.tfvars`, and `TF_VAR_*` environment variables work unchanged.
+
+**[Full documentation at oxid.dev/docs](https://oxid.dev/docs)**
+
+## Key Features
+
+### Blast Radius Analysis
+
+See exactly what breaks before you touch anything:
+
+```bash
+$ oxid blast-radius aws_vpc.main
+
+  Severity: HIGH  (32 resources, 3 levels deep)
+
+  Types: 4 aws_subnet, 3 aws_route_table, 1 aws_eks_cluster, 1 aws_eks_node_group...
+
+  Depth 1 - direct dependent (10 resources):
+    ~ aws_internet_gateway.main
+    ~ aws_subnet.private[0]
+    ~ aws_security_group.eks_cluster
+    ...
+
+  Depth 2 - transitive dependent (12 resources):
+    ~ aws_eks_cluster.main
+    ~ aws_nat_gateway.main[0]
+    ...
+```
+
+Reverse mode shows upstream dependencies:
+
+```bash
+$ oxid blast-radius aws_eks_node_group.main --why
+
+  Dependencies of aws_eks_node_group.main
+  14 upstream dependencies, 2 levels deep
+```
+
+Works with resource types too: `oxid blast-radius aws_subnet`
+
+[Learn more](https://oxid.dev/docs/blast-radius)
+
+### Resource Change History
+
+Full audit trail for every resource. Track tag changes, instance type changes, scaling events:
+
+```bash
+$ oxid history aws_vpc.main
+
+  2026-05-07T10:30:02+00:00 ~  update  (2h ago)
+    id: vpc-0626c706762a661e9
+    cidr_block: 10.0.0.0/16
+    tags: {"env":"prod","iac":"oxid"}
+    changes:
+      ~ tag "iac" = "terraform" -> "oxid"
+
+  2026-05-07T08:15:00+00:00 +  create  (4h ago)
+    id: vpc-0626c706762a661e9
+    cidr_block: 10.0.0.0/16
+    tags: {"env":"prod","iac":"terraform"}
+```
+
+Query history with SQL:
+
+```sql
+oxid query "SELECT address, action, captured_at FROM resource_history ORDER BY captured_at DESC"
+```
+
+[Learn more](https://oxid.dev/docs/history)
+
+### Structured JSON Logging
+
+Write structured logs for Datadog, Splunk, ELK, or OpenTelemetry:
+
+```bash
+oxid apply --log-file ./oxid.log
+```
+
+Every event includes resource address, resource ID, action, provider, and timing:
+
+```json
+{"timestamp":"...","level":"INFO","fields":{"event":"resource.apply.complete","address":"aws_vpc.main","resource_id":"vpc-0626c706762a661e9","action":"update","provider":"hashicorp/aws","elapsed_secs":1.2}}
+```
+
+### Terraform/OpenTofu Log Bridge
+
+Already using Terraform or OpenTofu? Pipe their JSON output through `oxid watch` to get structured logs without changing your workflow:
+
+```bash
+terraform apply -auto-approve -json | oxid watch --log-file ./tf.log
+tofu apply -auto-approve -json | oxid watch --log-file ./tf.log
+```
+
+[Learn more](https://oxid.dev/docs/logging)
+
+### SQL-Queryable State
+
+```sql
+-- Find all t3.micro instances
+oxid query "SELECT address FROM resources WHERE attributes_json->>'instance_type' = 't3.micro'"
+
+-- Resources missing tags
+oxid query "SELECT address FROM resources WHERE attributes_json->'tags' = '{}'"
+
+-- Count by resource type
+oxid query "SELECT resource_type, COUNT(*) FROM resources GROUP BY resource_type"
+```
+
+### Smart Apply
+
+Oxid only sends changed resources to providers. Unchanged resources are skipped entirely - no provider API calls, no noise in the output:
+
+```
+Plan: 0 to add, 1 to change, 0 to destroy.
+
+aws_vpc.main: Updating...
+aws_vpc.main: Update complete after 0s [id=vpc-0626c706762a661e9]
+
+Apply complete! Resources: 0 added, 1 changed, 0 destroyed. Total time: 0s.
+```
+
+## All Commands
+
+```bash
+oxid init                              # initialize providers and state
+oxid plan                              # preview changes
+oxid apply                             # apply changes
+oxid destroy                           # tear down infrastructure
+oxid state list                        # list managed resources
+oxid state show <address>              # show resource details
+oxid query "SQL"                       # query state with SQL
+oxid blast-radius <resource>           # downstream impact analysis
+oxid blast-radius <resource> --why     # upstream dependency chain
+oxid blast-radius --plan               # blast radius for planned changes
+oxid history <resource>                # resource change audit trail
+oxid drift                             # detect configuration drift
+oxid sync                              # sync from Terraform remote backend
+oxid output --json                     # show outputs (Terraform-compatible)
+oxid watch                             # watch Terraform/OpenTofu JSON output
+oxid graph                             # dependency graph (DOT format)
+oxid validate                          # validate configuration
+```
+
+## PostgreSQL for Teams
+
+```bash
+export OXID_DATABASE_URL="postgres://user:pass@host:5432/dbname"
+oxid init   # tables created automatically
+```
+
+Sensitive outputs are AES-256 encrypted at rest via pgcrypto. [Learn more](https://oxid.dev/docs/state/postgres)
+
+## Contributing
+
+We welcome contributions! Here's how:
+
+- **Try it** - Run `oxid plan` against your Terraform projects and report what works
+- **Report bugs** - [Open an issue](https://github.com/ops0-ai/oxid/issues)
+- **Test providers** - Try AWS, GCP, Azure, Kubernetes, Cloudflare
+- **Submit PRs** - Code contributions welcome
+
+### Build from Source
+
+```bash
+# Prerequisites: Rust 1.93+, protoc
+git clone https://github.com/ops0-ai/oxid.git
+cd oxid
+cargo build --release
+```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
+
+---
+
+<p align="center">
+  <a href="https://oxid.dev">oxid.dev</a> | Built by <a href="https://ops0.com">ops0.com</a>
+</p>

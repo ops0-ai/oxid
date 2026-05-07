@@ -221,6 +221,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Watch Terraform/OpenTofu JSON output and emit structured logs
+    /// Usage: terraform apply -json | oxid watch --log-file ./oxid.log
+    Watch,
 }
 
 #[derive(Subcommand)]
@@ -390,6 +394,7 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => cmd_history(&cli, address, limit, json).await,
+        Commands::Watch => cmd_watch().await,
     }
 }
 
@@ -1370,6 +1375,322 @@ async fn cmd_graph(cli: &Cli, graph_type: &str) -> Result<()> {
             "Unknown graph type '{}'. Use 'resource' or 'module'.",
             graph_type
         ),
+    }
+
+    Ok(())
+}
+
+async fn cmd_watch() -> Result<()> {
+    use std::io::BufRead;
+
+    tracing::info!(
+        event = "command.watch",
+        "Watching Terraform/OpenTofu JSON output from stdin"
+    );
+
+    let stdin = std::io::stdin();
+    let reader = stdin.lock();
+    let mut resource_count = 0usize;
+    let mut errors = 0usize;
+    let start = std::time::Instant::now();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Parse the Terraform JSON line
+        let event: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                // Not JSON - pass through as-is (terraform sometimes outputs non-JSON)
+                eprintln!("{}", line);
+                continue;
+            }
+        };
+
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let message = event.get("@message").and_then(|v| v.as_str()).unwrap_or("");
+        let level = event
+            .get("@level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info");
+
+        // Extract resource info from the hook field (apply events)
+        let hook = event.get("hook").cloned().unwrap_or(serde_json::json!({}));
+        let resource = hook
+            .get("resource")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let address = resource.get("addr").and_then(|v| v.as_str()).unwrap_or("");
+        let resource_type = resource
+            .get("resource_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Terraform uses "implied_provider" (e.g. "aws") or "provider" with full path
+        let provider = resource
+            .get("implied_provider")
+            .and_then(|v| v.as_str())
+            .or_else(|| resource.get("provider").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let action = hook.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let id_value = hook.get("id_value").and_then(|v| v.as_str()).unwrap_or("");
+        let id_key = hook.get("id_key").and_then(|v| v.as_str()).unwrap_or("id");
+        let elapsed = hook
+            .get("elapsed_secs")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+
+        match event_type {
+            "planned_change" => {
+                resource_count += 1;
+                let change = event
+                    .get("change")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                let change_resource = change
+                    .get("resource")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                let change_addr = change_resource
+                    .get("addr")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let change_type = change_resource
+                    .get("resource_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let change_action = change.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let change_provider = change_resource
+                    .get("implied_provider")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| change_resource.get("provider").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+
+                tracing::info!(
+                    event = "tf.resource.plan",
+                    source = "terraform",
+                    address = %change_addr,
+                    resource_type = %change_type,
+                    action = %change_action,
+                    provider = %change_provider,
+                    "Resource planned"
+                );
+
+                // Console output
+                let action_symbol = match change_action {
+                    "create" => "+".green(),
+                    "update" => "~".yellow(),
+                    "delete" => "-".red(),
+                    "replace" => "-/+".magenta(),
+                    _ => change_action.normal(),
+                };
+                println!(
+                    "  {} {} {} ({})",
+                    action_symbol,
+                    change_addr,
+                    change_action.dimmed(),
+                    change_provider.dimmed()
+                );
+            }
+            "change_summary" => {
+                let changes = event
+                    .get("changes")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                let add = changes.get("add").and_then(|v| v.as_u64()).unwrap_or(0);
+                let change = changes.get("change").and_then(|v| v.as_u64()).unwrap_or(0);
+                let remove = changes.get("remove").and_then(|v| v.as_u64()).unwrap_or(0);
+                let import = changes.get("import").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                tracing::info!(
+                    event = "tf.plan.summary",
+                    source = "terraform",
+                    creates = add,
+                    updates = change,
+                    deletes = remove,
+                    imports = import,
+                    "Plan summary"
+                );
+
+                println!(
+                    "\n  {} Plan: {} to add, {} to change, {} to destroy",
+                    ">>".bold(),
+                    add.to_string().green(),
+                    change.to_string().yellow(),
+                    remove.to_string().red()
+                );
+            }
+            "apply_start" => {
+                resource_count += 1;
+                tracing::info!(
+                    event = "tf.resource.apply.start",
+                    source = "terraform",
+                    address = %address,
+                    resource_type = %resource_type,
+                    action = %action,
+                    provider = %provider,
+                    "Resource apply started"
+                );
+                println!("  {}: {}...", address, "Applying".cyan());
+            }
+            "apply_complete" => {
+                tracing::info!(
+                    event = "tf.resource.apply.complete",
+                    source = "terraform",
+                    address = %address,
+                    resource_type = %resource_type,
+                    resource_id = %id_value,
+                    id_key = %id_key,
+                    action = %action,
+                    provider = %provider,
+                    elapsed_secs = elapsed,
+                    "Resource applied"
+                );
+                let id_display = if !id_value.is_empty() {
+                    format!(" [{}={}]", id_key, id_value)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {}: {} after {:.1}s{}",
+                    address,
+                    "Complete".green().bold(),
+                    elapsed,
+                    id_display.dimmed()
+                );
+            }
+            "apply_errored" => {
+                errors += 1;
+                tracing::error!(
+                    event = "tf.resource.apply.failed",
+                    source = "terraform",
+                    address = %address,
+                    resource_type = %resource_type,
+                    action = %action,
+                    provider = %provider,
+                    elapsed_secs = elapsed,
+                    "Resource apply failed"
+                );
+                println!(
+                    "  {}: {} after {:.1}s",
+                    address,
+                    "FAILED".red().bold(),
+                    elapsed
+                );
+            }
+            "refresh_start" => {
+                tracing::debug!(
+                    event = "tf.resource.refresh",
+                    source = "terraform",
+                    address = %address,
+                    resource_type = %resource_type,
+                    "Refreshing state"
+                );
+            }
+            "refresh_complete" => {
+                tracing::info!(
+                    event = "tf.resource.refresh.complete",
+                    source = "terraform",
+                    address = %address,
+                    resource_type = %resource_type,
+                    resource_id = %id_value,
+                    "State refreshed"
+                );
+            }
+            "diagnostic" => {
+                let severity = event
+                    .get("diagnostic")
+                    .and_then(|d| d.get("severity"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("error");
+                let summary = event
+                    .get("diagnostic")
+                    .and_then(|d| d.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let detail = event
+                    .get("diagnostic")
+                    .and_then(|d| d.get("detail"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if severity == "error" {
+                    errors += 1;
+                    tracing::error!(
+                        event = "tf.diagnostic",
+                        source = "terraform",
+                        severity = %severity,
+                        summary = %summary,
+                        detail = %detail,
+                        "Terraform diagnostic"
+                    );
+                    println!("  {} {}: {}", "Error:".red().bold(), summary, detail);
+                } else {
+                    tracing::warn!(
+                        event = "tf.diagnostic",
+                        source = "terraform",
+                        severity = %severity,
+                        summary = %summary,
+                        "Terraform diagnostic"
+                    );
+                }
+            }
+            "version" | "log" => {
+                // Version info or generic log - just log it
+                if level == "error" {
+                    tracing::error!(
+                        event = "tf.log",
+                        source = "terraform",
+                        message = %message,
+                        "Terraform error"
+                    );
+                }
+            }
+            _ => {
+                // Unknown event type - log at debug level
+                tracing::debug!(
+                    event = "tf.unknown",
+                    source = "terraform",
+                    event_type = %event_type,
+                    message = %message,
+                    "Unknown Terraform event"
+                );
+            }
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs();
+    tracing::info!(
+        event = "tf.watch.complete",
+        source = "terraform",
+        resources_processed = resource_count,
+        errors = errors,
+        elapsed_secs = elapsed,
+        "Watch complete"
+    );
+
+    println!();
+    if errors > 0 {
+        println!(
+            "  {} Watched {} resource(s), {} error(s) in {}s",
+            "!".red().bold(),
+            resource_count,
+            errors,
+            elapsed
+        );
+    } else {
+        println!(
+            "  {} Watched {} resource(s) in {}s",
+            "ok".green().bold(),
+            resource_count,
+            elapsed
+        );
     }
 
     Ok(())
