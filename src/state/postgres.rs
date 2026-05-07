@@ -1043,6 +1043,20 @@ impl StateBackend for PostgresBackend {
                     Ok(_) => {
                         if let Some(act) = action {
                             added += 1;
+                            let resource_id = instance
+                                .attributes
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            tracing::info!(
+                                event = "state.sync.resource",
+                                address = %address,
+                                resource_type = %tf_resource.resource_type,
+                                resource_id = %resource_id,
+                                action = %act,
+                                provider = %tf_resource.provider,
+                                "Resource synced"
+                            );
                             let _ = self
                                 .record_resource_history(
                                     workspace_id,
@@ -1055,7 +1069,12 @@ impl StateBackend for PostgresBackend {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to sync {}: {}", address, e);
+                        tracing::warn!(
+                            event = "state.sync.failed",
+                            address = %address,
+                            error = %e,
+                            "Failed to sync resource"
+                        );
                     }
                 }
             }

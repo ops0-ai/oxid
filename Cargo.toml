@@ -1,6 +1,6 @@
 [package]
 name = "oxid"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 description = "Standalone infrastructure-as-code engine — OSS alternative to Terraform/OpenTofu"
 license = "Apache-2.0"
@@ -37,7 +37,8 @@ dashmap = "6"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
 
 # Error handling
 anyhow = "1"

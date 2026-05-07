@@ -553,6 +553,21 @@ impl ResourceEngine {
             }
         }
 
+        // Log each planned change
+        for change in &changes {
+            if change.action != ResourceAction::NoOp {
+                info!(
+                    event = "resource.plan",
+                    address = %change.address,
+                    resource_type = %change.resource_type,
+                    action = %change.action,
+                    provider = %change.provider_source,
+                    requires_replace = ?change.requires_replace,
+                    "Resource planned"
+                );
+            }
+        }
+
         let creates = changes
             .iter()
             .filter(|c| c.action == ResourceAction::Create)
@@ -586,6 +601,17 @@ impl ResourceEngine {
         }
 
         let configuration = build_plan_configuration(workspace);
+
+        info!(
+            event = "plan.summary",
+            creates = creates,
+            updates = updates,
+            deletes = deletes,
+            replaces = replaces,
+            no_ops = no_ops,
+            total_resources = changes.len(),
+            "Plan complete"
+        );
 
         Ok(PlanSummary {
             changes,
@@ -675,9 +701,16 @@ impl ResourceEngine {
                                 let state: serde_json::Value =
                                     serde_json::from_str(&existing.attributes_json)?;
                                 resource_states.insert(address.clone(), state.clone());
+                                debug!(
+                                    event = "resource.skip",
+                                    address = %address,
+                                    resource_type = %resource_type,
+                                    provider = %provider_source,
+                                    reason = "no_changes",
+                                    "Resource unchanged, skipping apply"
+                                );
                                 return Ok(Some(state));
                             }
-                            // Resource not in state yet (new) but also not in plan — skip
                             return Ok(None);
                         }
 
@@ -861,7 +894,18 @@ impl ResourceEngine {
                                 )
                                 .await;
 
-                            info!(address = %address, "Resource applied successfully");
+                            let resource_id =
+                                new_state.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            info!(
+                                event = "resource.apply.complete",
+                                address = %address,
+                                resource_type = %resource_type,
+                                resource_id = %resource_id,
+                                provider = %provider_source,
+                                action = %action,
+                                workspace = %ws_id,
+                                "Resource applied successfully"
+                            );
                         }
 
                         Ok(apply_result.new_state)
@@ -943,6 +987,17 @@ impl ResourceEngine {
         let added = plan.creates + plan.replaces;
         let changed = plan.updates;
         let destroyed = plan.deletes;
+
+        info!(
+            event = "apply.summary",
+            added = added,
+            changed = changed,
+            destroyed = destroyed,
+            failed = failed,
+            skipped = skipped,
+            elapsed_secs = elapsed_secs,
+            "Apply complete"
+        );
 
         Ok(ApplySummary {
             results,
@@ -1091,9 +1146,24 @@ impl ResourceEngine {
                             .record_resource_history(&ws_id, address, "delete", None, None)
                             .await;
 
-                        info!(address = %address, "Resource destroyed");
-
                         // Return the prior state's ID so the walker can display it
+                        let resource_id = current_state
+                            .as_ref()
+                            .and_then(|s| s.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        info!(
+                            event = "resource.destroy.complete",
+                            address = %address,
+                            resource_type = %resource_type,
+                            resource_id = %resource_id,
+                            provider = %provider_source,
+                            action = "delete",
+                            workspace = %ws_id,
+                            "Resource destroyed"
+                        );
+
                         let resource_id = current_state
                             .as_ref()
                             .and_then(|s| s.get("id"))

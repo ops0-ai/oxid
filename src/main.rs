@@ -46,8 +46,12 @@ struct Cli {
     config: String,
 
     /// Enable verbose logging
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Write structured JSON logs to a file (for Datadog, Splunk, ELK)
+    #[arg(long, global = true)]
+    log_file: Option<String>,
 
     /// Working directory for .oxid state and cache
     #[arg(short, long, default_value = ".oxid")]
@@ -296,15 +300,50 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let filter = if cli.verbose {
+    let console_filter = if cli.verbose {
         EnvFilter::new("debug")
     } else {
         EnvFilter::new("warn")
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+
+    if let Some(ref log_path) = cli.log_file {
+        // Dual-layer: human console + structured JSON file
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+
+        let log_dir = std::path::Path::new(log_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let log_name = std::path::Path::new(log_path)
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("oxid.log"));
+
+        let file_appender = tracing_appender::rolling::never(log_dir, log_name);
+
+        let file_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(true)
+            .with_thread_ids(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(file_appender);
+
+        let console_layer = tracing_subscriber::fmt::layer().with_target(false);
+
+        let file_filter = EnvFilter::new("info");
+
+        tracing_subscriber::registry()
+            .with(console_layer.with_filter(console_filter))
+            .with(file_layer.with_filter(file_filter))
+            .init();
+    } else {
+        // Console only
+        tracing_subscriber::fmt()
+            .with_env_filter(console_filter)
+            .with_target(false)
+            .init();
+    };
 
     match cli.command {
         Commands::Init => cmd_init(&cli).await,
@@ -417,6 +456,7 @@ fn provider_manager(working_dir: &str) -> ProviderManager {
 // ─── Commands ────────────────────────────────────────────────────────────────
 
 async fn cmd_init(cli: &Cli) -> Result<()> {
+    tracing::info!(event = "command.init", config = %cli.config, "Initializing project");
     let config_path = Path::new(&cli.config);
     let working_dir = &cli.working_dir;
 
@@ -677,6 +717,13 @@ fn cmd_show(plan_file: &str, json: bool) -> Result<()> {
 }
 
 async fn cmd_apply(cli: &Cli, targets: &[String], auto_approve: bool) -> Result<()> {
+    tracing::info!(
+        event = "command.apply",
+        config = %cli.config,
+        auto_approve = auto_approve,
+        targets = ?targets,
+        "Starting apply"
+    );
     let workspace = loader::load_workspace(Path::new(&cli.config))?;
 
     // Validate count/for_each references before applying
@@ -829,6 +876,7 @@ async fn store_outputs(
 }
 
 async fn cmd_sync(cli: &Cli, state_file: Option<&str>) -> Result<()> {
+    tracing::info!(event = "command.sync", state_file = ?state_file, "Starting state sync");
     let config_path = Path::new(&cli.config);
     let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;
@@ -906,6 +954,14 @@ async fn cmd_sync(cli: &Cli, state_file: Option<&str>) -> Result<()> {
 
     let result = backend.sync_tfstate(&ws.id, &state_json).await?;
 
+    tracing::info!(
+        event = "sync.complete",
+        updated = result.updated,
+        added = result.added,
+        removed = result.removed,
+        "State sync complete"
+    );
+
     println!(
         "\n  {} Sync complete: {} resource(s) synced, {} removed",
         "✓".green().bold(),
@@ -917,6 +973,11 @@ async fn cmd_sync(cli: &Cli, state_file: Option<&str>) -> Result<()> {
 }
 
 async fn cmd_destroy(cli: &Cli, _targets: &[String], auto_approve: bool) -> Result<()> {
+    tracing::info!(
+        event = "command.destroy",
+        auto_approve = auto_approve,
+        "Starting destroy"
+    );
     let workspace = loader::load_workspace(Path::new(&cli.config))?;
     let backend = open_backend(&cli.working_dir).await?;
     backend.initialize().await?;

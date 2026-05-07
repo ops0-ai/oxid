@@ -8,7 +8,7 @@ use colored::Colorize;
 use dashmap::DashMap;
 use petgraph::graph::NodeIndex;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::debug;
+use tracing::{debug, error};
 
 use super::resource_graph::{DagNode, ResourceGraph};
 
@@ -245,8 +245,15 @@ impl DagWalker {
                                 );
                             }
                             NodeStatus::Failed(err) => {
+                                error!(
+                                    event = "resource.apply.failed",
+                                    address = %result.address,
+                                    error = %err,
+                                    elapsed_secs = elapsed_secs,
+                                    "Resource operation failed"
+                                );
                                 println!(
-                                    "{}: {} after {} — {}",
+                                    "{}: {} after {} - {}",
                                     result.address.bold(),
                                     "FAILED".red().bold(),
                                     format_duration(elapsed_secs),

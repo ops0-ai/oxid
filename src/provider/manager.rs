@@ -57,8 +57,10 @@ impl ProviderManager {
 
         // Resolve version from registry
         info!(
-            "Resolving provider {}/{} version {}",
-            namespace, provider_type, version_constraint
+            event = "provider.resolve",
+            provider = %format!("{}/{}", namespace, provider_type),
+            version_constraint = %version_constraint,
+            "Resolving provider version"
         );
         let version = self
             .registry
@@ -76,8 +78,10 @@ impl ProviderManager {
 
         // Download from registry
         info!(
-            "Downloading provider {}/{}@{}",
-            namespace, provider_type, version
+            event = "provider.download",
+            provider = %format!("{}/{}", namespace, provider_type),
+            version = %version,
+            "Downloading provider"
         );
         let download_info = self
             .registry
@@ -92,11 +96,11 @@ impl ProviderManager {
             .await?;
 
         info!(
-            "Provider {}/{}@{} downloaded to {}",
-            namespace,
-            provider_type,
-            version,
-            binary_path.display()
+            event = "provider.download.complete",
+            provider = %format!("{}/{}", namespace, provider_type),
+            version = %version,
+            path = %binary_path.display(),
+            "Provider downloaded"
         );
 
         Ok(binary_path)
