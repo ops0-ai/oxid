@@ -4,11 +4,11 @@
     <strong>Open-source infrastructure-as-code engine. Drop-in alternative to Terraform and OpenTofu.</strong>
   </p>
   <p align="center">
-    <a href="https://oxid.dev/docs">Documentation</a> |
-    <a href="https://oxid.dev/docs/quickstart">Quick Start</a> |
-    <a href="https://oxid.dev/docs/blast-radius">Blast Radius</a> |
-    <a href="https://oxid.dev/docs/history">Resource History</a> |
-    <a href="https://oxid.dev/docs/logging">Observability</a>
+    <a href="https://oxid.sh/docs">Documentation</a> |
+    <a href="https://oxid.sh/docs/quickstart">Quick Start</a> |
+    <a href="https://oxid.sh/docs/blast-radius">Blast Radius</a> |
+    <a href="https://oxid.sh/docs/history">Resource History</a> |
+    <a href="https://oxid.sh/docs/logging">Observability</a>
   </p>
   <p align="center">
     <a href="https://github.com/ops0-ai/oxid/releases"><img src="https://img.shields.io/github/v/release/ops0-ai/oxid?style=flat-square&color=blue" alt="Release"></a>
@@ -54,7 +54,7 @@ oxid apply      # apply infrastructure
 
 Your existing `.tf` files, `.tfvars`, and `TF_VAR_*` environment variables work unchanged.
 
-**[Full documentation at oxid.dev/docs](https://oxid.dev/docs)**
+**[Full documentation at oxid.sh/docs](https://oxid.sh/docs)**
 
 ## Key Features
 
@@ -92,7 +92,7 @@ $ oxid blast-radius aws_eks_node_group.main --why
 
 Works with resource types too: `oxid blast-radius aws_subnet`
 
-[Learn more](https://oxid.dev/docs/blast-radius)
+
 
 ### Resource Change History
 
@@ -120,7 +120,7 @@ Query history with SQL:
 oxid query "SELECT address, action, captured_at FROM resource_history ORDER BY captured_at DESC"
 ```
 
-[Learn more](https://oxid.dev/docs/history)
+
 
 ### Structured JSON Logging
 
@@ -145,7 +145,7 @@ terraform apply -auto-approve -json | oxid watch --log-file ./tf.log
 tofu apply -auto-approve -json | oxid watch --log-file ./tf.log
 ```
 
-[Learn more](https://oxid.dev/docs/logging)
+
 
 ### SQL-Queryable State
 
@@ -202,7 +202,7 @@ export OXID_DATABASE_URL="postgres://user:pass@host:5432/dbname"
 oxid init   # tables created automatically
 ```
 
-Sensitive outputs are AES-256 encrypted at rest via pgcrypto. [Learn more](https://oxid.dev/docs/state/postgres)
+Sensitive outputs are AES-256 encrypted at rest via pgcrypto.
 
 ## Contributing
 
@@ -229,5 +229,5 @@ Apache-2.0. See [LICENSE](LICENSE).
 ---
 
 <p align="center">
-  <a href="https://oxid.dev">oxid.dev</a> | Built by <a href="https://ops0.com">ops0.com</a>
+  <a href="https://oxid.sh">oxid.sh</a> | Built by <a href="https://ops0.com">ops0.com</a>
 </p>
