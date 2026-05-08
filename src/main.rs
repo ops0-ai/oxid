@@ -1392,6 +1392,7 @@ async fn cmd_watch() -> Result<()> {
     let reader = stdin.lock();
     let mut resource_count = 0usize;
     let mut errors = 0usize;
+    let mut detected_source = "terraform"; // default, auto-detected from @module
     let start = std::time::Instant::now();
 
     for line in reader.lines() {
@@ -1420,6 +1421,13 @@ async fn cmd_watch() -> Result<()> {
             .get("@level")
             .and_then(|v| v.as_str())
             .unwrap_or("info");
+
+        // Auto-detect source from @module field (terraform.ui vs tofu.ui)
+        if let Some(module) = event.get("@module").and_then(|v| v.as_str()) {
+            if module.starts_with("tofu") || module.starts_with("opentofu") {
+                detected_source = "opentofu";
+            }
+        }
 
         // Extract resource info from the hook field (apply events)
         let hook = event.get("hook").cloned().unwrap_or(serde_json::json!({}));
@@ -1474,7 +1482,7 @@ async fn cmd_watch() -> Result<()> {
 
                 tracing::info!(
                     event = "tf.resource.plan",
-                    source = "terraform",
+                    source = %detected_source,
                     address = %change_addr,
                     resource_type = %change_type,
                     action = %change_action,
@@ -1510,7 +1518,7 @@ async fn cmd_watch() -> Result<()> {
 
                 tracing::info!(
                     event = "tf.plan.summary",
-                    source = "terraform",
+                    source = %detected_source,
                     creates = add,
                     updates = change,
                     deletes = remove,
@@ -1530,7 +1538,7 @@ async fn cmd_watch() -> Result<()> {
                 resource_count += 1;
                 tracing::info!(
                     event = "tf.resource.apply.start",
-                    source = "terraform",
+                    source = %detected_source,
                     address = %address,
                     resource_type = %resource_type,
                     action = %action,
@@ -1542,7 +1550,7 @@ async fn cmd_watch() -> Result<()> {
             "apply_complete" => {
                 tracing::info!(
                     event = "tf.resource.apply.complete",
-                    source = "terraform",
+                    source = %detected_source,
                     address = %address,
                     resource_type = %resource_type,
                     resource_id = %id_value,
@@ -1569,7 +1577,7 @@ async fn cmd_watch() -> Result<()> {
                 errors += 1;
                 tracing::error!(
                     event = "tf.resource.apply.failed",
-                    source = "terraform",
+                    source = %detected_source,
                     address = %address,
                     resource_type = %resource_type,
                     action = %action,
@@ -1587,7 +1595,7 @@ async fn cmd_watch() -> Result<()> {
             "refresh_start" => {
                 tracing::debug!(
                     event = "tf.resource.refresh",
-                    source = "terraform",
+                    source = %detected_source,
                     address = %address,
                     resource_type = %resource_type,
                     "Refreshing state"
@@ -1596,7 +1604,7 @@ async fn cmd_watch() -> Result<()> {
             "refresh_complete" => {
                 tracing::info!(
                     event = "tf.resource.refresh.complete",
-                    source = "terraform",
+                    source = %detected_source,
                     address = %address,
                     resource_type = %resource_type,
                     resource_id = %id_value,
@@ -1624,7 +1632,7 @@ async fn cmd_watch() -> Result<()> {
                     errors += 1;
                     tracing::error!(
                         event = "tf.diagnostic",
-                        source = "terraform",
+                        source = %detected_source,
                         severity = %severity,
                         summary = %summary,
                         detail = %detail,
@@ -1634,7 +1642,7 @@ async fn cmd_watch() -> Result<()> {
                 } else {
                     tracing::warn!(
                         event = "tf.diagnostic",
-                        source = "terraform",
+                        source = %detected_source,
                         severity = %severity,
                         summary = %summary,
                         "Terraform diagnostic"
@@ -1646,7 +1654,7 @@ async fn cmd_watch() -> Result<()> {
                 if level == "error" {
                     tracing::error!(
                         event = "tf.log",
-                        source = "terraform",
+                        source = %detected_source,
                         message = %message,
                         "Terraform error"
                     );
@@ -1656,7 +1664,7 @@ async fn cmd_watch() -> Result<()> {
                 // Unknown event type - log at debug level
                 tracing::debug!(
                     event = "tf.unknown",
-                    source = "terraform",
+                    source = %detected_source,
                     event_type = %event_type,
                     message = %message,
                     "Unknown Terraform event"
@@ -1668,7 +1676,7 @@ async fn cmd_watch() -> Result<()> {
     let elapsed = start.elapsed().as_secs();
     tracing::info!(
         event = "tf.watch.complete",
-        source = "terraform",
+        source = %detected_source,
         resources_processed = resource_count,
         errors = errors,
         elapsed_secs = elapsed,
