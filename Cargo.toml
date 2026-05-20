@@ -1,6 +1,6 @@
 [package]
 name = "oxid"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Standalone infrastructure-as-code engine — OSS alternative to Terraform/OpenTofu"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ serde_yaml = "0.9"
 serde_json = "1"
 
 # HCL parsing
-hcl-rs = "0.18"
+hcl-rs = "0.19"
 
 # Dependency graph
 petgraph = "0.6"
