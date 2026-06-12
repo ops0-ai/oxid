@@ -488,25 +488,50 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
             Ok(workspace) => {
                 let pm = provider_manager(working_dir);
                 let mut downloaded = 0;
+
+                // Build the final provider download list, merging:
+                //   1. terraform.required_providers (authoritative source for non-hashicorp providers)
+                //   2. provider "name" {} blocks
+                // required_providers takes precedence for source resolution.
+                let mut providers_to_download: std::collections::HashMap<
+                    String,
+                    (String, Option<String>),
+                > = std::collections::HashMap::new();
+
+                // Start with provider blocks (source defaults to hashicorp/<name>)
                 for provider in &workspace.providers {
-                    let version = provider.version_constraint.as_deref().unwrap_or(">= 0.0.0");
+                    providers_to_download.insert(
+                        provider.name.clone(),
+                        (provider.source.clone(), provider.version_constraint.clone()),
+                    );
+                }
+
+                // Override with required_providers (correct source for non-hashicorp providers)
+                if let Some(ref tf) = workspace.terraform_settings {
+                    for (name, req) in &tf.required_providers {
+                        let existing_version =
+                            providers_to_download.get(name).and_then(|(_, v)| v.clone());
+                        providers_to_download.insert(
+                            name.clone(),
+                            (req.source.clone(), req.version.clone().or(existing_version)),
+                        );
+                    }
+                }
+
+                for (_name, (source, version_constraint)) in &providers_to_download {
+                    let version = version_constraint.as_deref().unwrap_or(">= 0.0.0");
                     tracing::info!(
-                        provider = %provider.source,
+                        provider = %source,
                         version = %version,
                         "Downloading provider"
                     );
-                    match pm.ensure_provider(&provider.source, version).await {
+                    match pm.ensure_provider(source, version).await {
                         Ok(path) => {
-                            println!(
-                                "  {} {} ({})",
-                                "+".green(),
-                                provider.source.bold(),
-                                path.display()
-                            );
+                            println!("  {} {} ({})", "+".green(), source.bold(), path.display());
                             downloaded += 1;
                         }
                         Err(e) => {
-                            println!("  {} {} — {}", "!".yellow(), provider.source.bold(), e);
+                            println!("  {} {} — {}", "!".yellow(), source.bold(), e);
                         }
                     }
                 }
