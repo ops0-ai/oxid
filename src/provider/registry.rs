@@ -99,12 +99,30 @@ impl RegistryClient {
             self.base_url, namespace, provider_type
         );
 
-        let resp: VersionsResponse = self
+        let response = self
             .http
             .get(&url)
             .send()
             .await
-            .context("Failed to query provider registry")?
+            .context("Failed to query provider registry")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                bail!(
+                    "Provider '{}/{}' not found in registry. Did you mean a non-hashicorp provider?\n  - Check the source in required_providers (e.g. source = \"gavinbunney/kubectl\" or source = \"cloudflare/cloudflare\")\n  - Verify the namespace at https://registry.terraform.io",
+                    namespace, provider_type
+                );
+            }
+            bail!(
+                "Registry returned HTTP {} for provider '{}/{}'",
+                status,
+                namespace,
+                provider_type
+            );
+        }
+
+        let resp: VersionsResponse = response
             .json()
             .await
             .context("Failed to parse registry response")?;
@@ -237,12 +255,35 @@ impl RegistryClient {
             self.base_url, namespace, provider_type, version, os, arch
         );
 
-        let resp: DownloadResponse = self
+        let response = self
             .http
             .get(&url)
             .send()
             .await
-            .context("Failed to query download URL")?
+            .context("Failed to query download URL")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                bail!(
+                    "No download available for '{}/{}@{}' on {}/{}",
+                    namespace,
+                    provider_type,
+                    version,
+                    os,
+                    arch
+                );
+            }
+            bail!(
+                "Registry returned HTTP {} for download of '{}/{}@{}'",
+                status,
+                namespace,
+                provider_type,
+                version
+            );
+        }
+
+        let resp: DownloadResponse = response
             .json()
             .await
             .context("Failed to parse download response")?;
