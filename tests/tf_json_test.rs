@@ -602,3 +602,120 @@ fn test_json_only_directory_mode_detection() {
     let ws = load_workspace(dir.path()).unwrap();
     assert_eq!(ws.resources.len(), 1);
 }
+
+// ─── .tfvars.json loading ────────────────────────────────────────────────────
+
+fn literal_default(ws: &WorkspaceConfig, name: &str) -> Value {
+    let var = ws
+        .variables
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("variable {} should exist", name));
+    match &var.default {
+        Some(Expression::Literal(v)) => v.clone(),
+        other => panic!("expected literal default for {}, got {:?}", name, other),
+    }
+}
+
+#[test]
+fn test_auto_tfvars_json_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.tf"),
+        r#"
+variable "region" {}
+variable "count_nodes" {}
+variable "tags" {}
+variable "subnets" {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("network.auto.tfvars.json"),
+        r#"{
+  "region": "uk-london-1",
+  "count_nodes": 3,
+  "tags": {"env": "dev", "managed": true},
+  "subnets": ["10.0.0.0/24", "10.0.1.0/24"]
+}"#,
+    )
+    .unwrap();
+
+    let ws = parse_directory(dir.path()).unwrap();
+    assert_eq!(
+        literal_default(&ws, "region"),
+        Value::String("uk-london-1".into())
+    );
+    assert_eq!(literal_default(&ws, "count_nodes"), Value::Int(3));
+    assert_eq!(
+        literal_default(&ws, "tags"),
+        Value::Map(vec![
+            ("env".into(), Value::String("dev".into())),
+            ("managed".into(), Value::Bool(true)),
+        ])
+    );
+    assert_eq!(
+        literal_default(&ws, "subnets"),
+        Value::List(vec![
+            Value::String("10.0.0.0/24".into()),
+            Value::String("10.0.1.0/24".into()),
+        ])
+    );
+}
+
+#[test]
+fn test_tfvars_precedence_with_json() {
+    // terraform.tfvars < terraform.tfvars.json < *.auto.tfvars(.json) in
+    // alphabetical order, regardless of format
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.tf"),
+        r#"
+variable "a" {}
+variable "b" {}
+variable "c" {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("terraform.tfvars"),
+        "a = \"tfvars\"\nb = \"tfvars\"\nc = \"tfvars\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("terraform.tfvars.json"),
+        r#"{"b": "tfvars_json", "c": "tfvars_json"}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("x.auto.tfvars"), "c = \"x_auto\"\n").unwrap();
+    std::fs::write(
+        dir.path().join("y.auto.tfvars.json"),
+        r#"{"c": "y_auto_json"}"#,
+    )
+    .unwrap();
+
+    let ws = parse_directory(dir.path()).unwrap();
+    assert_eq!(literal_default(&ws, "a"), Value::String("tfvars".into()));
+    assert_eq!(
+        literal_default(&ws, "b"),
+        Value::String("tfvars_json".into())
+    );
+    assert_eq!(
+        literal_default(&ws, "c"),
+        Value::String("y_auto_json".into())
+    );
+}
+
+#[test]
+fn test_tfvars_json_non_object_root_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.tf"), "variable \"a\" {}\n").unwrap();
+    std::fs::write(dir.path().join("bad.auto.tfvars.json"), "[1, 2]").unwrap();
+
+    let err = parse_directory(dir.path()).unwrap_err();
+    assert!(
+        format!("{:#}", err).contains("root must be a JSON object"),
+        "unexpected error: {:#}",
+        err
+    );
+}

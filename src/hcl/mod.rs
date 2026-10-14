@@ -63,9 +63,10 @@ pub fn parse_directory(dir: &Path) -> Result<WorkspaceConfig> {
     // Load .tfvars files and apply them to variable defaults.
     // Precedence (highest to lowest):
     //   1. TF_VAR_xxx environment variables
-    //   2. terraform.tfvars (if present)
-    //   3. *.auto.tfvars (alphabetical)
-    //   4. Variable defaults from .tf files
+    //   2. *.auto.tfvars / *.auto.tfvars.json (alphabetical)
+    //   3. terraform.tfvars.json (if present)
+    //   4. terraform.tfvars (if present)
+    //   5. Variable defaults from .tf files
     let tfvars = load_tfvars(dir)?;
     apply_tfvars(&mut workspace, &tfvars);
 
@@ -79,15 +80,18 @@ pub fn parse_directory(dir: &Path) -> Result<WorkspaceConfig> {
 fn load_tfvars(dir: &Path) -> Result<HashMap<String, Expression>> {
     let mut values = HashMap::new();
 
-    // Load terraform.tfvars if present
-    let default_tfvars = dir.join("terraform.tfvars");
-    if default_tfvars.exists() {
-        tracing::info!("Loading {}", default_tfvars.display());
-        let parsed = parse_tfvars_file(&default_tfvars)?;
-        values.extend(parsed);
+    // Load terraform.tfvars, then terraform.tfvars.json, if present
+    for name in ["terraform.tfvars", "terraform.tfvars.json"] {
+        let default_tfvars = dir.join(name);
+        if default_tfvars.exists() {
+            tracing::info!("Loading {}", default_tfvars.display());
+            let parsed = parse_any_tfvars_file(&default_tfvars)?;
+            values.extend(parsed);
+        }
     }
 
-    // Load *.auto.tfvars files (alphabetical order)
+    // Load *.auto.tfvars and *.auto.tfvars.json files together, in
+    // alphabetical order of filename (matches Terraform behavior)
     let entries = std::fs::read_dir(dir)?;
     let mut auto_files: Vec<std::path::PathBuf> = entries
         .filter_map(|e| e.ok())
@@ -95,7 +99,7 @@ fn load_tfvars(dir: &Path) -> Result<HashMap<String, Expression>> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".auto.tfvars"))
+                .map(|n| n.ends_with(".auto.tfvars") || n.ends_with(".auto.tfvars.json"))
                 .unwrap_or(false)
         })
         .collect();
@@ -103,11 +107,59 @@ fn load_tfvars(dir: &Path) -> Result<HashMap<String, Expression>> {
 
     for file in &auto_files {
         tracing::info!("Loading {}", file.display());
-        let parsed = parse_tfvars_file(file)?;
+        let parsed = parse_any_tfvars_file(file)?;
         values.extend(parsed);
     }
 
     Ok(values)
+}
+
+/// Parse a .tfvars or .tfvars.json file, dispatching on the extension.
+fn parse_any_tfvars_file(path: &Path) -> Result<HashMap<String, Expression>> {
+    if path.extension().map(|e| e == "json").unwrap_or(false) {
+        parse_tfvars_json_file(path)
+    } else {
+        parse_tfvars_file(path)
+    }
+}
+
+/// Parse a single .tfvars.json file into a map of variable name → Expression.
+/// The root must be a JSON object; values are literals (no interpolation).
+fn parse_tfvars_json_file(path: &Path) -> Result<HashMap<String, Expression>> {
+    let content =
+        std::fs::read_to_string(path).context(format!("Failed to read {}", path.display()))?;
+    let root: serde_json::Value =
+        serde_json::from_str(&content).context(format!("Failed to parse {}", path.display()))?;
+    let serde_json::Value::Object(obj) = root else {
+        anyhow::bail!(
+            "Failed to parse {}: root must be a JSON object",
+            path.display()
+        );
+    };
+
+    Ok(obj
+        .iter()
+        .map(|(name, v)| (name.clone(), Expression::Literal(json_to_value(v))))
+        .collect())
+}
+
+/// Convert a JSON value into a literal Value.
+fn json_to_value(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Float(n.as_f64().unwrap_or_default()),
+        },
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
+        serde_json::Value::Object(obj) => Value::Map(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
+    }
 }
 
 /// Parse a single .tfvars file into a map of variable name → Expression.
