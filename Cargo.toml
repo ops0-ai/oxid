@@ -78,11 +78,16 @@ zip = "2"
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 
+# OCI request signing for OCI backend state import (optional)
+rsa = { version = "0.9", features = ["sha2"], optional = true }
+base64 = { version = "0.22", optional = true }
+
 [features]
-default = ["sqlite", "postgres", "s3-backend"]
+default = ["sqlite", "postgres", "s3-backend", "oci-backend"]
 sqlite = []
 postgres = ["sqlx"]
 s3-backend = ["aws-sdk-s3", "aws-config"]
+oci-backend = ["rsa", "base64"]
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -93,3 +98,4 @@ tempfile = "3"
 tokio-test = "0.4"
 assert_cmd = "2"
 predicates = "3"
+rand = "0.8"

@@ -137,6 +137,21 @@ fn parse_backend_block(block: &hcl::Block) -> BackendConfig {
             endpoint: attrs.remove("endpoint"),
             profile: attrs.remove("profile"),
         },
+        "oci" => BackendConfig::Oci {
+            bucket: attrs.remove("bucket").unwrap_or_default(),
+            namespace: attrs.remove("namespace").unwrap_or_default(),
+            // Terraform's oci backend defaults the object name to terraform.tfstate
+            key: attrs
+                .remove("key")
+                .unwrap_or_else(|| "terraform.tfstate".to_string()),
+            region: attrs.remove("region"),
+            tenancy_ocid: attrs.remove("tenancy_ocid"),
+            user_ocid: attrs.remove("user_ocid"),
+            fingerprint: attrs.remove("fingerprint"),
+            private_key_path: attrs.remove("private_key_path"),
+            config_file_profile: attrs.remove("config_file_profile"),
+            auth: attrs.remove("auth"),
+        },
         _ => BackendConfig::Unsupported { backend_type },
     }
 }

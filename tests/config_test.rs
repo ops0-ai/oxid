@@ -286,3 +286,69 @@ project:
     let azs = vpc.variables.get("azs").unwrap();
     assert!(azs.is_sequence());
 }
+
+#[test]
+fn test_oci_backend_block_parsed() {
+    use oxid::config::types::BackendConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("_backend.tf"),
+        r#"
+terraform {
+  backend "oci" {
+    bucket       = "terraform-iac"
+    key          = "Dev/DNS/terraform.tfstate"
+    namespace    = "axsewdef1qua"
+    region       = "uk-london-1"
+    tenancy_ocid = "ocid1.tenancy.oc1..example"
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let ws = oxid::hcl::parse_directory(dir.path()).unwrap();
+    let backend = ws.terraform_settings.unwrap().backend.unwrap();
+    match &backend {
+        BackendConfig::Oci {
+            bucket,
+            namespace,
+            key,
+            region,
+            tenancy_ocid,
+            config_file_profile,
+            ..
+        } => {
+            assert_eq!(bucket, "terraform-iac");
+            assert_eq!(namespace, "axsewdef1qua");
+            assert_eq!(key, "Dev/DNS/terraform.tfstate");
+            assert_eq!(region.as_deref(), Some("uk-london-1"));
+            assert_eq!(tenancy_ocid.as_deref(), Some("ocid1.tenancy.oc1..example"));
+            assert_eq!(config_file_profile, &None);
+        }
+        other => panic!("expected OCI backend, got {:?}", other),
+    }
+    assert_eq!(
+        backend.location(),
+        "oci://axsewdef1qua/terraform-iac/Dev/DNS/terraform.tfstate  (region: uk-london-1)"
+    );
+}
+
+#[test]
+fn test_oci_backend_key_defaults_to_terraform_tfstate() {
+    use oxid::config::types::BackendConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.tf"),
+        "terraform {\n  backend \"oci\" {\n    bucket = \"b\"\n    namespace = \"n\"\n  }\n}\n",
+    )
+    .unwrap();
+
+    let ws = oxid::hcl::parse_directory(dir.path()).unwrap();
+    match ws.terraform_settings.unwrap().backend.unwrap() {
+        BackendConfig::Oci { key, .. } => assert_eq!(key, "terraform.tfstate"),
+        other => panic!("expected OCI backend, got {:?}", other),
+    }
+}

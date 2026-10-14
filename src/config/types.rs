@@ -98,9 +98,56 @@ pub enum BackendConfig {
         endpoint: Option<String>,
         profile: Option<String>,
     },
+    /// OCI Object Storage backend (`backend "oci"`, Terraform 1.12+).
+    /// Credentials not set here are read from the OCI CLI config file.
+    Oci {
+        bucket: String,
+        namespace: String,
+        key: String,
+        region: Option<String>,
+        tenancy_ocid: Option<String>,
+        user_ocid: Option<String>,
+        fingerprint: Option<String>,
+        private_key_path: Option<String>,
+        config_file_profile: Option<String>,
+        auth: Option<String>,
+    },
     Unsupported {
         backend_type: String,
     },
+}
+
+impl BackendConfig {
+    /// Human-readable location of the remote state, for CLI output.
+    pub fn location(&self) -> String {
+        match self {
+            BackendConfig::S3 {
+                bucket,
+                key,
+                region,
+                ..
+            } => format!(
+                "s3://{}/{}  (region: {})",
+                bucket,
+                key,
+                region.as_deref().unwrap_or("default")
+            ),
+            BackendConfig::Oci {
+                bucket,
+                namespace,
+                key,
+                region,
+                ..
+            } => format!(
+                "oci://{}/{}/{}  (region: {})",
+                namespace,
+                bucket,
+                key,
+                region.as_deref().unwrap_or("from OCI config")
+            ),
+            BackendConfig::Unsupported { backend_type } => backend_type.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -2,6 +2,8 @@ pub mod backend;
 pub mod lock;
 pub mod migration;
 pub mod models;
+#[cfg(feature = "oci-backend")]
+pub mod oci;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "postgres")]

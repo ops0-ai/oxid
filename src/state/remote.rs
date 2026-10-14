@@ -22,10 +22,11 @@ pub async fn fetch_remote_state(backend: &BackendConfig) -> Result<String> {
             )
             .await
         }
+        BackendConfig::Oci { .. } => fetch_oci_state(backend).await,
         BackendConfig::Unsupported { backend_type } => {
             bail!(
                 "Backend type '{}' is not yet supported for remote state import.\n\
-                 Supported backends: s3\n\
+                 Supported backends: s3, oci\n\
                  Workaround: manually download the state file and use 'oxid import tfstate <path>'",
                 backend_type
             );
@@ -90,6 +91,48 @@ async fn fetch_s3_state(
     bail!(
         "S3 backend support is not compiled in.\n\
          Rebuild with: cargo build --features s3-backend\n\
+         Or download the state file manually and use: oxid import tfstate <path>"
+    );
+}
+
+#[cfg(feature = "oci-backend")]
+async fn fetch_oci_state(backend: &BackendConfig) -> Result<String> {
+    let BackendConfig::Oci {
+        bucket,
+        namespace,
+        key,
+        region,
+        tenancy_ocid,
+        user_ocid,
+        fingerprint,
+        private_key_path,
+        config_file_profile,
+        auth,
+    } = backend
+    else {
+        bail!("fetch_oci_state called with a non-OCI backend");
+    };
+
+    crate::state::oci::fetch_state(&crate::state::oci::OciBackend {
+        bucket,
+        namespace,
+        key,
+        region: region.as_deref(),
+        tenancy_ocid: tenancy_ocid.as_deref(),
+        user_ocid: user_ocid.as_deref(),
+        fingerprint: fingerprint.as_deref(),
+        private_key_path: private_key_path.as_deref(),
+        config_file_profile: config_file_profile.as_deref(),
+        auth: auth.as_deref(),
+    })
+    .await
+}
+
+#[cfg(not(feature = "oci-backend"))]
+async fn fetch_oci_state(_backend: &BackendConfig) -> Result<String> {
+    bail!(
+        "OCI backend support is not compiled in.\n\
+         Rebuild with: cargo build --features oci-backend\n\
          Or download the state file manually and use: oxid import tfstate <path>"
     );
 }

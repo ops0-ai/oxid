@@ -610,17 +610,12 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
                 {
                     println!();
                     match remote_backend {
-                        crate::config::types::BackendConfig::S3 {
-                            bucket,
-                            key,
-                            region,
-                            ..
-                        } => {
+                        crate::config::types::BackendConfig::S3 { .. }
+                        | crate::config::types::BackendConfig::Oci { .. } => {
                             println!(
-                                "  {} Detected Terraform S3 backend: s3://{}/{}",
+                                "  {} Detected Terraform backend: {}",
                                 "→".blue(),
-                                bucket,
-                                key
+                                remote_backend.location()
                             );
                             println!("{}", "  Fetching remote state...".dimmed());
                             match crate::state::remote::fetch_remote_state(remote_backend).await {
@@ -628,10 +623,9 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
                                     let result =
                                         backend.import_tfstate(&ws.id, &state_json).await?;
                                     println!(
-                                        "  {} Imported {} resource(s) from S3 backend (region: {})",
+                                        "  {} Imported {} resource(s) from remote backend",
                                         "✓".green().bold(),
-                                        result.imported,
-                                        region.as_deref().unwrap_or("default")
+                                        result.imported
                                     );
                                     if result.skipped > 0 {
                                         println!(
@@ -951,29 +945,21 @@ async fn cmd_sync(cli: &Cli, state_file: Option<&str>) -> Result<()> {
                      Use --state-file to specify a state file path.",
                 )?;
 
-            match remote_backend {
-                crate::config::types::BackendConfig::S3 {
-                    bucket,
-                    key,
-                    region,
-                    ..
-                } => {
-                    println!("  {} Syncing from S3: s3://{}/{}", "→".blue(), bucket, key);
-                    println!(
-                        "  {} Region: {}",
-                        "→".blue(),
-                        region.as_deref().unwrap_or("default")
-                    );
-                }
-                crate::config::types::BackendConfig::Unsupported { backend_type } => {
-                    bail!(
-                        "Backend '{}' is not yet supported for remote sync.\n  \
-                         Supported: s3\n  \
-                         Workaround: download the state file and use --state-file",
-                        backend_type
-                    );
-                }
+            if let crate::config::types::BackendConfig::Unsupported { backend_type } =
+                remote_backend
+            {
+                bail!(
+                    "Backend '{}' is not yet supported for remote sync.\n  \
+                     Supported: s3, oci\n  \
+                     Workaround: download the state file and use --state-file",
+                    backend_type
+                );
             }
+            println!(
+                "  {} Syncing from {}",
+                "→".blue(),
+                remote_backend.location()
+            );
 
             println!("{}", "  Fetching remote state...".dimmed());
             crate::state::remote::fetch_remote_state(remote_backend)
@@ -1208,29 +1194,15 @@ async fn cmd_import(cli: &Cli, command: &ImportCommands) -> Result<()> {
                         .and_then(|ts| ts.backend.as_ref())
                         .context(
                             "No backend configuration found in .tf files.\n\
-                             Expected: terraform { backend \"s3\" { ... } }\n\
+                             Expected: terraform { backend \"s3\" { ... } } or backend \"oci\"\n\
                              Alternatively, specify a local file: oxid import tfstate <path>",
                         )?;
 
-                    match remote_backend {
-                        crate::config::types::BackendConfig::S3 {
-                            bucket,
-                            key,
-                            region,
-                            ..
-                        } => {
-                            println!(
-                                "  {} Detected S3 backend: s3://{}/{}  (region: {})",
-                                "->".blue(),
-                                bucket,
-                                key,
-                                region.as_deref().unwrap_or("default")
-                            );
-                        }
-                        crate::config::types::BackendConfig::Unsupported { backend_type } => {
-                            println!("  {} Detected backend: {}", "->".blue(), backend_type);
-                        }
-                    }
+                    println!(
+                        "  {} Detected backend: {}",
+                        "->".blue(),
+                        remote_backend.location()
+                    );
 
                     println!("{}", "Fetching remote state...".dimmed());
                     crate::state::remote::fetch_remote_state(remote_backend).await?
