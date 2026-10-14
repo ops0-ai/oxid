@@ -1386,7 +1386,7 @@ async fn cmd_graph(cli: &Cli, graph_type: &str) -> Result<()> {
             let var_defaults = executor::engine::build_variable_defaults(&workspace);
             let (graph, _) =
                 dag::resource_graph::build_resource_dag(&workspace, &provider_map, &var_defaults)?;
-            let dot = dag::resource_graph::to_dot(&graph);
+            let dot = dag::resource_graph::to_dot_with_modules(&graph, &workspace);
             println!("{}", dot);
         }
         "module" => {
