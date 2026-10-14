@@ -286,3 +286,57 @@ project:
     let azs = vpc.variables.get("azs").unwrap();
     assert!(azs.is_sequence());
 }
+
+#[test]
+fn test_provider_blocks_use_required_providers_source() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("versions.tf"),
+        r#"
+terraform {
+  required_providers {
+    gitlab = {
+      source  = "gitlabhq/gitlab"
+      version = "~> 18.0"
+    }
+    oci = {
+      source = "oracle/oci"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("providers.tf"),
+        r#"
+provider "gitlab" {}
+provider "oci" {}
+provider "oci" {
+  alias = "home"
+}
+provider "random" {}
+"#,
+    )
+    .unwrap();
+
+    let ws = oxid::hcl::parse_directory(dir.path()).unwrap();
+    let sources: Vec<(&str, Option<&str>, &str, Option<&str>)> = ws
+        .providers
+        .iter()
+        .map(|p| {
+            (
+                p.name.as_str(),
+                p.alias.as_deref(),
+                p.source.as_str(),
+                p.version_constraint.as_deref(),
+            )
+        })
+        .collect();
+
+    assert!(sources.contains(&("gitlab", None, "gitlabhq/gitlab", Some("~> 18.0"))));
+    assert!(sources.contains(&("oci", None, "oracle/oci", None)));
+    assert!(sources.contains(&("oci", Some("home"), "oracle/oci", None)));
+    // Not declared in required_providers: keeps the hashicorp default
+    assert!(sources.contains(&("random", None, "hashicorp/random", None)));
+}

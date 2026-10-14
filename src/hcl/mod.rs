@@ -60,6 +60,8 @@ pub fn parse_directory(dir: &Path) -> Result<WorkspaceConfig> {
         merge_workspace(&mut workspace, partial);
     }
 
+    resolve_provider_sources(&mut workspace);
+
     // Load .tfvars files and apply them to variable defaults.
     // Precedence (highest to lowest):
     //   1. TF_VAR_xxx environment variables
@@ -73,6 +75,26 @@ pub fn parse_directory(dir: &Path) -> Result<WorkspaceConfig> {
     apply_env_vars(&mut workspace);
 
     Ok(workspace)
+}
+
+/// Resolve provider block sources and versions from
+/// terraform.required_providers. Provider blocks are parsed without knowing
+/// the declared source, so they default to hashicorp/<name>; the
+/// required_providers entry is authoritative when present.
+fn resolve_provider_sources(workspace: &mut WorkspaceConfig) {
+    let Some(ref tf) = workspace.terraform_settings else {
+        return;
+    };
+    for provider in &mut workspace.providers {
+        if let Some(req) = tf.required_providers.get(&provider.name) {
+            if !req.source.is_empty() {
+                provider.source = req.source.clone();
+            }
+            if provider.version_constraint.is_none() {
+                provider.version_constraint = req.version.clone();
+            }
+        }
+    }
 }
 
 /// Load variable values from .tfvars files in the directory.
