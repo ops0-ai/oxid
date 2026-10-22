@@ -155,14 +155,70 @@ fn format_elapsed(secs: u64) -> String {
 pub struct ResourceEngine {
     provider_manager: Arc<ProviderManager>,
     parallelism: usize,
+    path_module: String,
+    path_root: String,
+    path_cwd: String,
+    workspace_name: String,
 }
 
 impl ResourceEngine {
     pub fn new(provider_manager: Arc<ProviderManager>, parallelism: usize) -> Self {
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        Self::with_paths(
+            provider_manager,
+            parallelism,
+            cwd.clone(),
+            cwd.clone(),
+            cwd,
+            "default".to_string(),
+        )
+    }
+
+    /// Create an engine with Terraform-compatible path and workspace expression values.
+    ///
+    /// `workspace_name` is the workspace name (such as `default`), not its state store id.
+    pub fn with_paths(
+        provider_manager: Arc<ProviderManager>,
+        parallelism: usize,
+        path_module: String,
+        path_root: String,
+        path_cwd: String,
+        workspace_name: String,
+    ) -> Self {
         Self {
             provider_manager,
             parallelism,
+            path_module,
+            path_root,
+            path_cwd,
+            workspace_name,
         }
+    }
+
+    fn context_with_states(
+        &self,
+        var_defaults: HashMap<String, serde_json::Value>,
+        resource_states: Arc<DashMap<String, serde_json::Value>>,
+    ) -> EvalContext {
+        EvalContext::with_states(var_defaults, resource_states).with_paths(
+            self.path_module.clone(),
+            self.path_root.clone(),
+            self.path_cwd.clone(),
+            self.workspace_name.clone(),
+        )
+    }
+
+    fn context_plan_only(&self, var_defaults: HashMap<String, serde_json::Value>) -> EvalContext {
+        EvalContext::plan_only(var_defaults).with_paths(
+            self.path_module.clone(),
+            self.path_root.clone(),
+            self.path_cwd.clone(),
+            self.workspace_name.clone(),
+        )
     }
 
     /// Get a reference to the provider manager.
@@ -296,10 +352,8 @@ impl ResourceEngine {
                     );
 
                     // Build eval context with count.index / each.key + existing resource states
-                    let mut eval_ctx = EvalContext::with_states(
-                        var_defaults.clone(),
-                        Arc::clone(&resource_states),
-                    );
+                    let mut eval_ctx = self
+                        .context_with_states(var_defaults.clone(), Arc::clone(&resource_states));
                     match index {
                         Some(crate::config::types::ResourceIndex::Count(i)) => {
                             eval_ctx.count_index = Some(*i)
@@ -474,10 +528,8 @@ impl ResourceEngine {
                         planned_count,
                         total_resources,
                     );
-                    let mut ds_eval_ctx = EvalContext::with_states(
-                        var_defaults.clone(),
-                        Arc::clone(&resource_states),
-                    );
+                    let mut ds_eval_ctx = self
+                        .context_with_states(var_defaults.clone(), Arc::clone(&resource_states));
                     match index {
                         Some(crate::config::types::ResourceIndex::Count(i)) => {
                             ds_eval_ctx.count_index = Some(*i);
@@ -642,6 +694,10 @@ impl ResourceEngine {
         let pm = Arc::clone(&self.provider_manager);
         let ws_id = workspace_id.to_string();
         let backend_clone = Arc::clone(&backend);
+        let path_module = self.path_module.clone();
+        let path_root = self.path_root.clone();
+        let path_cwd = self.path_cwd.clone();
+        let workspace_name = self.workspace_name.clone();
         // Shared map of completed resource states for cross-resource reference resolution.
         // As each resource completes, its new state is inserted here so dependents can
         // resolve references like `aws_s3_bucket.public_scripts.id`.
@@ -667,6 +723,10 @@ impl ResourceEngine {
             let resource_states = Arc::clone(&resource_states);
             let var_defaults = var_defaults.clone();
             let changed_addresses = Arc::clone(&changed_addresses);
+            let path_module = path_module.clone();
+            let path_root = path_root.clone();
+            let path_cwd = path_cwd.clone();
+            let workspace_name = workspace_name.clone();
 
             Box::pin(async move {
                 match node {
@@ -681,6 +741,12 @@ impl ResourceEngine {
                         let mut eval_ctx = EvalContext::with_states(
                             var_defaults.clone(),
                             Arc::clone(&resource_states),
+                        )
+                        .with_paths(
+                            path_module.clone(),
+                            path_root.clone(),
+                            path_cwd.clone(),
+                            workspace_name.clone(),
                         );
                         match index {
                             Some(crate::config::types::ResourceIndex::Count(i)) => {
@@ -921,6 +987,12 @@ impl ResourceEngine {
                         let mut eval_ctx = EvalContext::with_states(
                             var_defaults.clone(),
                             Arc::clone(&resource_states),
+                        )
+                        .with_paths(
+                            path_module.clone(),
+                            path_root.clone(),
+                            path_cwd.clone(),
+                            workspace_name.clone(),
                         );
                         match index {
                             Some(crate::config::types::ResourceIndex::Count(i)) => {
@@ -1046,6 +1118,10 @@ impl ResourceEngine {
         let pm = Arc::clone(&self.provider_manager);
         let ws_id = workspace_id.to_string();
         let backend_clone = Arc::clone(&backend);
+        let path_module = self.path_module.clone();
+        let path_root = self.path_root.clone();
+        let path_cwd = self.path_cwd.clone();
+        let workspace_name = self.workspace_name.clone();
 
         self.initialize_providers(workspace).await?;
 
@@ -1054,6 +1130,10 @@ impl ResourceEngine {
             let ws_id = ws_id.clone();
             let backend = Arc::clone(&backend_clone);
             let var_defaults = var_defaults.clone();
+            let path_module = path_module.clone();
+            let path_root = path_root.clone();
+            let path_cwd = path_cwd.clone();
+            let workspace_name = workspace_name.clone();
 
             Box::pin(async move {
                 match node {
@@ -1065,7 +1145,12 @@ impl ResourceEngine {
                         ref index,
                         ..
                     } => {
-                        let mut eval_ctx = EvalContext::plan_only(var_defaults.clone());
+                        let mut eval_ctx = EvalContext::plan_only(var_defaults.clone()).with_paths(
+                            path_module.clone(),
+                            path_root.clone(),
+                            path_cwd.clone(),
+                            workspace_name.clone(),
+                        );
                         match index {
                             Some(crate::config::types::ResourceIndex::Count(i)) => {
                                 eval_ctx.count_index = Some(*i);
@@ -1301,6 +1386,14 @@ pub struct EvalContext {
     pub each_key: Option<String>,
     /// Current for_each value.
     pub each_value: Option<serde_json::Value>,
+    /// Absolute directory of the current root module.
+    pub path_module: String,
+    /// Absolute directory of the root module.
+    pub path_root: String,
+    /// Absolute directory from which oxid was invoked.
+    pub path_cwd: String,
+    /// Current Terraform workspace name.
+    pub workspace_name: String,
 }
 
 impl EvalContext {
@@ -1311,6 +1404,10 @@ impl EvalContext {
             count_index: None,
             each_key: None,
             each_value: None,
+            path_module: String::new(),
+            path_root: String::new(),
+            path_cwd: String::new(),
+            workspace_name: "default".to_string(),
         }
     }
 
@@ -1324,7 +1421,25 @@ impl EvalContext {
             count_index: None,
             each_key: None,
             each_value: None,
+            path_module: String::new(),
+            path_root: String::new(),
+            path_cwd: String::new(),
+            workspace_name: "default".to_string(),
         }
+    }
+
+    pub fn with_paths(
+        mut self,
+        path_module: String,
+        path_root: String,
+        path_cwd: String,
+        workspace_name: String,
+    ) -> Self {
+        self.path_module = path_module;
+        self.path_root = path_root;
+        self.path_cwd = path_cwd;
+        self.workspace_name = workspace_name;
+        self
     }
 }
 
@@ -1816,6 +1931,20 @@ fn resolve_reference(parts: &[String], ctx: &EvalContext) -> serde_json::Value {
             }
             _ => return serde_json::Value::Null,
         }
+    }
+
+    // Terraform path and workspace references.
+    if parts.len() == 2 && parts[0] == "path" {
+        return match parts[1].as_str() {
+            "module" => serde_json::Value::String(ctx.path_module.clone()),
+            "root" => serde_json::Value::String(ctx.path_root.clone()),
+            "cwd" => serde_json::Value::String(ctx.path_cwd.clone()),
+            _ => serde_json::Value::Null,
+        };
+    }
+
+    if parts.len() == 2 && parts[0] == "terraform" && parts[1] == "workspace" {
+        return serde_json::Value::String(ctx.workspace_name.clone());
     }
 
     // data.TYPE.NAME.ATTR
